@@ -20,7 +20,7 @@ import { Manifold } from '../ref/manifold.ts';
 import { defaultParams, type Solver, type SolverParams } from '../ref/solver.ts';
 import {
   ARGS_ITEMS_3D, B_ANGVEL, B_INERTIAL_POS, B_INERTIAL_ROT, B_INITIAL_POS, B_INITIAL_ROT, B_MOMENT, B_POS, B_ROT, B_SIZE, B_VEL, BODY_FLOATS,
-  C_MANIFOLDS, CONTACT_WORDS, FLAG_FACE_BIAS, FLAG_MASS_PENALTY, FLAG_MATCH_NEAREST, FLAG_REUSE_CONTACTS, FLAG_START_AT_REST, J_C0_ANG, J_C0_LIN, J_LAM_ANG, K_LAM, K_PEN, K_RA, K_RB, M_GEO, MANIFOLD_WORDS, STICK_BIT,
+  C_MANIFOLDS, C_TAIL_BODIES, CONTACT_WORDS, FLAG_FACE_BIAS, FLAG_SPARSE_COLORS, FLAG_MASS_PENALTY, FLAG_MATCH_NEAREST, FLAG_REUSE_CONTACTS, FLAG_START_AT_REST, J_C0_ANG, J_C0_LIN, J_LAM_ANG, K_LAM, K_PEN, K_RA, K_RB, M_GEO, MANIFOLD_WORDS, SPARSE_COLOR_START, STICK_BIT,
   J_BREAK_BEND, J_LAM_LIN, J_PEN_ANG, J_PEN_LIN, J_RA, J_RB, J_REST, J_REST_START, J_YIELD, JOINT_FLOATS, PARAM_WORDS, PRELUDE_3D, SHAPE_BOX, SHAPE_HULL, SHAPE_SAIL, SHAPE_SPHERE, T_JOINT, T_SPRING,
   TOPOLOGY_ACCESSORS_3D,
 } from './layout.ts';
@@ -33,6 +33,8 @@ import { largestSmall } from './radii.ts';
 export { PHASES, type StepProfile };
 
 export interface GpuCounters3D extends GpuCounters {
+  /** Active bodies in the colour tail, for the dispatch scheduling hint. */
+  tailBodies?: number;
   /** Contact pairs (manifolds) written by the last step. */
   manifolds: number;
 }
@@ -473,6 +475,10 @@ export class GpuSolver3D {
   primalLanes: [number, number, number] = [2 ** 31, 2 ** 15, 2 ** 12];
   /** Encode each phase as its own compute pass even when not profiling. */
   splitPasses = false;
+  /** Fuse tail colours in small active scenes, retaining their solve order. */
+  fuseSparseColors = true;
+  private useSparseColors = false;
+  private tailBodies = Infinity;
   private shrinkVotes = 0;
   /** Jones-Plassmann rounds per step (even); adapted to the clash count by `adapt`. */
   colorRounds: number;
@@ -516,6 +522,7 @@ export class GpuSolver3D {
   private stepCount = 0;
   private passBuffer: GPUBuffer | null = null;
   private passEntries = 0;
+  private passAlpha = NaN;
 
   /** Which contact buffer this step writes (the other holds last step's contacts). */
   private parity = 0;
@@ -584,7 +591,7 @@ export class GpuSolver3D {
     this.tableSize = pow2AtLeast(2 * cap);
     this.gridBuffer = device.createBuffer({ label: 'grid 3d', size: (2 * this.tableSize + 1 + 4 * cap) * 4, usage: storageUsage() });
     this.counterBuffer = device.createBuffer({ label: 'counters', size: COUNTER_WORDS * 4, usage: storageUsage() });
-    this.argsBuffer = device.createBuffer({ label: 'indirect args', size: ARGS_WORDS * 4, usage: storageUsage() | GPUBufferUsage.INDIRECT });
+    this.argsBuffer = device.createBuffer({ label: 'indirect args', size: (ARGS_WORDS + 3) * 4, usage: storageUsage() | GPUBufferUsage.INDIRECT });
     this.colorGroups = Math.ceil(cap / COLOR_WG);
     this.colorBuffer = device.createBuffer({ label: 'colours', size: (3 * cap + 65 + MAX_COLORS * this.colorGroups + 1) * 4, usage: storageUsage() });
     this.paramsBuffer = device.createBuffer({ label: 'params 3d', size: PARAM_WORDS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -699,12 +706,20 @@ export class GpuSolver3D {
     // compiled when the first hull arrives (acquireHull). The layout binds the hull buffer anyway.
     make(shaders.contacts ?? contactsWGSL, [L.contacts], ['hashInsert', 'narrowphase']);
     this.contactShaders = { make: (code) => make(code, [L.contacts], ['hashInsert', 'narrowphase']), custom: !!shaders.contacts };
-    make(makeTopologyWGSL(PRELUDE_3D, TOPOLOGY_ACCESSORS_3D), [L.topo], [
+    make(makeTopologyWGSL(PRELUDE_3D, TOPOLOGY_ACCESSORS_3D, `atomicStore(&counters[${C_TAIL_BODIES}u], atomicLoad(&color[params.colorHistOffset + MAX_COLORS * params.colorGroups]) - atomicLoad(&color[params.colorHistOffset + ${SPARSE_COLOR_START}u * params.colorGroups]));`), [L.topo], [
       'degreeJoints', 'degreeContacts', 'fillJoints', 'fillContacts', 'sortAdjacency',
       'colorCompact', 'colorMark', 'colorRoundAB', 'colorRoundBA', 'colorCount', 'colorStarts', 'colorScatter',
     ]);
-    make(shaders.solve ?? solveWGSL, [L.solve, L.pass], ['warmStartJoints', 'warmStartBodies', 'primal', 'dual', 'updateVelocities']);
-    make(makeArgsWGSL(PRELUDE_3D, ARGS_ITEMS_3D), [L.args], ['argsPrev', 'argsPairs', 'argsContacts', 'argsColors']);
+    make(shaders.solve ?? solveWGSL, [L.solve, L.pass], ['warmStartJoints', 'warmStartBodies', 'primal', 'dual', 'updateVelocities', ...(!shaders.solve ? ['primalSparse'] : [])]);
+    make(makeArgsWGSL(PRELUDE_3D, { ...ARGS_ITEMS_3D, colors: `
+      let sparse = (params.flags & FLAG_SPARSE_COLORS) != 0u;
+      let n = colorThreads(color[params.colorStartOffset + c + 1u] - color[params.colorStartOffset + c]);
+      setArgs(IA_COLOR + 3u * c, n);
+      if (c == 0u) {
+        let total = color[params.colorStartOffset + max(params.colorCap, SPARSE_COLOR_START)] - color[params.colorStartOffset + SPARSE_COLOR_START];
+        setArgs(${ARGS_WORDS}u, select(0u, 64u, sparse && total > 0u));
+      }
+    ` }), [L.args], ['argsPrev', 'argsPairs', 'argsContacts', 'argsColors']);
   }
 
   private allocateJoints(capacity: number): void {
@@ -1336,7 +1351,7 @@ export class GpuSolver3D {
     f[3] = p.betaAng;
     f[4] = p.gamma;
     f[5] = p.alpha;
-    u[6] = (p.matchNearest ? FLAG_MATCH_NEAREST : 0) | (p.faceBias ? FLAG_FACE_BIAS : 0) | (p.reuseContacts ? FLAG_REUSE_CONTACTS : 0) | (p.startAtRest ? FLAG_START_AT_REST : 0) | (p.massPenalty ? FLAG_MASS_PENALTY : 0);
+    u[6] = (p.matchNearest ? FLAG_MATCH_NEAREST : 0) | (p.faceBias ? FLAG_FACE_BIAS : 0) | (p.reuseContacts ? FLAG_REUSE_CONTACTS : 0) | (p.startAtRest ? FLAG_START_AT_REST : 0) | (p.massPenalty ? FLAG_MASS_PENALTY : 0) | (this.useSparseColors ? FLAG_SPARSE_COLORS : 0);
     u[7] = this.bodyCount;
     u[8] = this.jointCount;
     u[9] = this.colorCap;
@@ -1368,28 +1383,27 @@ export class GpuSolver3D {
     this.device.queue.writeBuffer(this.paramsBuffer, 0, buf);
   }
 
-  /** Pass constants: per iteration, one entry per colour (primal), then one for the dual. */
-  private writePassConstants(iterations: number, alpha: number): void {
-    const perIteration = this.colorCap + 1;
-    // At least one entry: the warm-start dispatches bind entry 0 even with no iterations
-    const entries = Math.max(iterations * perIteration, 1);
+  /** One entry per colour, shared by every iteration (all use the same alpha). */
+  private writePassConstants(alpha: number): void {
+    const entries = this.colorCap + 1;
     if (entries > this.passEntries || !this.passGroup) {
       this.passBuffer?.destroy();
       this.passBuffer = this.device.createBuffer({ label: 'pass constants', size: entries * PASS_STRIDE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.passEntries = entries;
+      this.passAlpha = NaN;
       this.passGroup = this.device.createBindGroup({ layout: this.layouts.pass, entries: [{ binding: 0, resource: { buffer: this.passBuffer, size: 16 } }] });
     }
-    const data = new ArrayBuffer(entries * PASS_STRIDE);
+    if (this.passAlpha === alpha) return;
+    const data = new ArrayBuffer(this.passEntries * PASS_STRIDE);
     const u32 = new Uint32Array(data);
     const f32 = new Float32Array(data);
-    for (let it = 0; it < iterations; it++) {
-      for (let col = 0; col <= this.colorCap; col++) {
-        const w = ((it * perIteration + col) * PASS_STRIDE) / 4;
-        u32[w] = col;
-        f32[w + 1] = alpha;
-      }
+    for (let col = 0; col < this.passEntries; col++) {
+      const w = (col * PASS_STRIDE) / 4;
+      u32[w] = col;
+      f32[w + 1] = alpha;
     }
     this.device.queue.writeBuffer(this.passBuffer!, 0, data);
+    this.passAlpha = alpha;
   }
 
   step(): void {
@@ -1399,9 +1413,24 @@ export class GpuSolver3D {
       this.device.queue.writeBuffer(this.colorBuffer, 0, this.fixedColors);
       this.colorCap = Math.max(1, ...this.fixedColors.map((c) => (c === NO_COLOR ? 0 : c + 1)));
     }
+    // A bounded active set keeps a serial tail affordable; large scenes retain full GPU
+    // parallelism. This is only a performance choice: the tail handles any bucket size.
+    let active = 0;
+    this.useSparseColors = false;
+    if (this.fuseSparseColors && this.pipes.primalSparse && this.colorCap > SPARSE_COLOR_START) {
+      for (let i = 0; i < this.bodyCount && active <= 1024; i++) if (this.bodies[i].dynamic) active++;
+      let tail = this.tailBodies;
+      if (this.fixedColors) {
+        tail = 0;
+        for (let i = 0; i < this.bodyCount; i++) {
+          if (this.bodies[i].dynamic && this.fixedColors[i] !== NO_COLOR && this.fixedColors[i] >= SPARSE_COLOR_START) tail++;
+        }
+      }
+      this.useSparseColors = active <= 128 || (active <= 1024 && tail <= 128);
+    }
     this.stepCount++;
     this.writeParams();
-    this.writePassConstants(p.iterations, p.alpha);
+    this.writePassConstants(p.alpha);
 
     const cur = this.parity;
     const cap = this.bodyCapacity;
@@ -1476,7 +1505,6 @@ export class GpuSolver3D {
 
     // Solve
     beginPhase();
-    const perIteration = this.colorCap + 1;
     const setPass = (entry: number) => pass.setBindGroup(1, this.passGroup!, [entry * PASS_STRIDE]);
     pass.setBindGroup(0, G.solve[cur]);
     setPass(0);
@@ -1488,11 +1516,15 @@ export class GpuSolver3D {
     pass.dispatchWorkgroups(groups(N));
     for (let it = 0; it < p.iterations; it++) {
       pass.setPipeline(this.pipes.primal);
-      for (let col = 0; col < this.colorCap; col++) {
-        setPass(it * perIteration + col);
+      for (let col = 0; col < (this.useSparseColors ? SPARSE_COLOR_START : this.colorCap); col++) {
+        setPass(col);
         pass.dispatchWorkgroupsIndirect(this.argsBuffer, (IA_COLOR + 3 * col) * 4);
       }
-      setPass(it * perIteration + this.colorCap);
+      if (this.useSparseColors) {
+        pass.setPipeline(this.pipes.primalSparse);
+        pass.dispatchWorkgroupsIndirect(this.argsBuffer, ARGS_WORDS * 4);
+      }
+      setPass(this.colorCap);
       pass.setPipeline(this.pipes.dual);
       pass.dispatchWorkgroupsIndirect(this.argsBuffer, IA_CONSTRAINTS * 4);
     }
@@ -1542,7 +1574,7 @@ export class GpuSolver3D {
 
   async readCounters(): Promise<GpuCounters3D> {
     const c = new Uint32Array(await this.read(this.counterBuffer, COUNTER_WORDS * 4));
-    return { pairs: c[C_PAIRS], contacts: c[C_CONTACTS], manifolds: c[C_MANIFOLDS], overflow: c[C_OVERFLOW], clashes: c[C_CLASHES], colors: c[C_NUM_COLORS] };
+    return { tailBodies: c[C_TAIL_BODIES], pairs: c[C_PAIRS], contacts: c[C_CONTACTS], manifolds: c[C_MANIFOLDS], overflow: c[C_OVERFLOW], clashes: c[C_CLASHES], colors: c[C_NUM_COLORS] };
   }
 
   /** Contact points written by the last step, with their pair's bodies and normal. */
@@ -1596,6 +1628,8 @@ export class GpuSolver3D {
   /** Bodies per colour below which two threads per body pay off (measured, docs/FINDINGS.md). */
   /** Adapt the colour cap and pair/contact capacity to a recent counters readback. */
   adapt(counters: GpuCounters3D): void {
+    // Only a scheduling hint. A stale readback can cost time, never omit a colour or body.
+    this.tailBodies = counters.tailBodies ?? Infinity;
     if (this.fixedColors) return;
     // Colour cap: colours in use + COLOR_SPARE. Each colour below the cap costs a dispatch per
     // iteration, but a body with no colour left below the cap shares the last one with a

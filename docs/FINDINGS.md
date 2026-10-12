@@ -1305,3 +1305,50 @@ Revisit the GPU default (post-stab vs α) with these metrics in Stage 2.
   ~3 mm/s. This is the C++ behaviour too.
 - CPU cost (M-series, Node): Pyramid (211 bodies) 2.7 ms/step, Joint Grid (625) 7.3 ms/step;
   the O(n²) broadphase dominates the grid scene.
+
+## Bounded color-tail dispatches (#16, 2026-10-12)
+
+For small active sets, colors 16 and above now run in one workgroup, sequentially by color
+and in chunks within each color. Storage barriers preserve Gauss-Seidel color order; no
+Jacobi update or color relabeling is introduced. The host omits the individual tail
+commands: at cap 64, 14 iterations, primal dispatch calls fall from 896 to 238. Pass
+constants are shared across iterations and uploaded only when alpha changes or the buffer
+grows (232,960 bytes per step previously, versus 16,640 once at cap 64).
+
+The first prototype left empty indirect commands in place; independent review correctly
+identified that this left the main overhead. The next prototype exposed a dense-tail
+regression (1,000 bodies serialized: GPU solve 2.818 -> 9.961 ms). The final policy fuses
+at most 128 active bodies, or at most 1,024 active bodies with a recent tail count <=128.
+Fixed-color validation uses the exact CPU count. Other scenes use the count supplied to
+`adapt`, conservatively starting on the parallel path. A stale hint can temporarily cost
+performance, but the fused kernel always processes all current colors and chunks. Large
+active sets and dense tails retain parallel dispatches; custom solve shaders also retain
+the original path. `fuseSparseColors = false` disables fusion for comparison.
+
+The existing cap already shrinks after three quiet readbacks; regression coverage verifies
+64 -> 4 and regrowth on clashes. This does not solve pathological graph-coloring clashes
+or guarantee a minimum palette. Default coloring and color order are unchanged.
+
+Validation: 81 CPU tests and the full 77-test GPU gate passed, plus the subsequently added
+stale-hint test (78 distinct GPU tests, zero skips), typecheck, Vite build and library build.
+New coverage compares complete states for fusion, multi-chunk tails, >1,024-body fallback,
+alpha/iteration changes, and an underestimated hint with dynamic coloring. Three baseline
+comparisons against main 9b9c27b produced zero differing body-state values after 60 steps
+in all five scenes, including alpha/iteration/cap changes.
+
+`node --experimental-transform-types scripts/compare3d-gpu.ts <baseline-checkout>` runs
+sequentially on one Dawn device. These are deliberately cap-64 stress measurements, not
+normal adaptive-demo FPS claims. 120-step wall time and nine GPU samples per scene,
+medians across three runs; M4 Max with shared GPU load (load 6.94, GPU utilization 49%):
+
+| Scene | Wall ms/step old -> new | GPU solve ms old -> new |
+| --- | ---: | ---: |
+| 10k fixed + 512 moving | 10.085 -> 2.928 | 2.753 -> 0.852 |
+| 125-body pile | 9.616 -> 2.757 | 2.621 -> 0.918 |
+| 32-joint hub | 9.956 -> 3.137 | 3.277 -> 0.918 |
+| Hub with sparse high color labels | 9.840 -> 2.788 | 4.850 -> 2.032 |
+| 1k bodies in one high-label bucket (parallel fallback) | 9.845 -> 10.568 | 3.736 -> 3.408 |
+
+The dense fallback wall-time result is mixed with GPU time under load; no gain is claimed
+for it. GPU timestamps are quantized (~0.0655 ms). The real destruction session and older
+hardware still need measurements before extrapolating these targeted gains.
