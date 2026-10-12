@@ -7,7 +7,7 @@
 import * as THREE from 'three/webgpu';
 import { B_ANGVEL, B_POS, B_ROT, B_VEL, BODY_FLOATS } from '../avbd3d/gpu/layout.ts';
 import { decodeJoint, type JointState } from '../avbd3d/gpu/joints.ts';
-import { checkBreakBend, GpuSolver3D, gpuParams3D, unitRotation } from '../avbd3d/gpu/solver.ts';
+import { checkBreakBend, GpuSolver3D, gpuParams3D, unitRotation, type GpuStepOptions } from '../avbd3d/gpu/solver.ts';
 import { Rigid } from '../avbd3d/ref/body.ts';
 import { Solver } from '../avbd3d/ref/solver.ts';
 import { convexHull, hull, type HullShape, sphere } from '../avbd3d/shapes.ts';
@@ -18,6 +18,8 @@ import { type Ray, Raycaster } from './raycast.ts';
 export type Vec3 = [number, number, number];
 /** A unit quaternion, x y z w (as THREE.Quaternion's toArray). */
 export type Quat = [number, number, number, number];
+
+export type StepOptions = GpuStepOptions;
 
 export interface WorldOptions {
   /** Share the renderer's GPU device, so BodyMesh can draw the bodies with no copies. */
@@ -850,11 +852,12 @@ export class World {
     return n;
   }
 
-  /** One fixed step (dt). */
-  step(): void {
+  /** One fixed step (dt). Detect contacts by default; optionally reuse within a frame. */
+  step(options: StepOptions = {}): void {
+    const movingKinematics = this.moves.size > 0;
     this.flush();
     this.push();
-    this.solver.step();
+    this.solver.step(movingKinematics ? {} : options);
     this.steps++;
     if (this.contactWatch && (this.reporting.size || this.contactsLive)) {
       this.contactWatch.run(this.solver.contactStorage, this.solver.manifoldCapacity, this.steps, this.dt);

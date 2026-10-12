@@ -2,6 +2,46 @@
 
 Measured results that drive design decisions. Newest first. Each entry says how it was measured.
 
+## 2026-10-12 — #15: opt-in contact-manifold reuse between explicit substeps (STE-2538)
+
+`step({ reuseManifolds: true })` retains the previous contact set, recomputes its
+separation from current poses, and applies the existing warm-start decay. It skips the
+broadphase/hash/narrowphase, while adjacency, coloring and solving still run each substep.
+The first call, body/filter/constraint writes, capacity changes and queued World kinematic
+moves force detection. Custom contact shaders without the entry point fall back to detection.
+Default `step()` and `update()` keep their prior behavior. Detect at the start of every frame;
+this is not CCD and is unsuitable for fast impacts or rapidly changing contact normals.
+Broadphase diagnostics explicitly refer to the last detecting step during reuse.
+
+Validation: typecheck, 81 CPU tests, 82 Dawn GPU tests (zero skips), Vite and library builds
+pass. Seven new GPU cases cover refreshed separation, first-call fallback, invalidation,
+empty sets, a supported stack, retained pair diagnostics, queued kinematics and rotating hull
+friction (some cases cover more than one behavior). A no-reuse comparison against main
+9b9c27b has bit-identical complete body buffers at both 60 and 180 steps in all four scenes.
+
+Measured on M4 Max under shared load (uptime load 12.31/10.49/10.58, GPU utilization sampled
+at 47%). Three sequential, back-to-back baseline/candidate comparisons, dt=1/120, candidate
+reusing every second substep. Each run warms up 60 steps, times 120 steps, and profiles nine
+fresh/reused pairs (median pair-average GPU timings). Command:
+`node --experimental-transform-types scripts/compare3d-gpu.ts <baseline> --reuse`.
+Omit `--reuse` to require exact default-path body-state equivalence.
+
+| Scene | Wall ms/step old → reuse | GPU collision ms old → reuse | GPU total ms old → reuse |
+|---|---:|---:|---:|
+| 10,000 fixed + 512 movers | 1.002 → 1.023 | 0.131 → 0.066 | 0.590 → 0.524 |
+| 125-body pile | 0.979 → 0.988 | 0.164 → 0.098 | 0.721 → 0.623 |
+| 32-joint hub | 1.011 → 0.975 | 0.066 → 0.066 | 0.623 → 0.623 |
+| Mixed-size fixed grid + 512 movers | 2.419 → 1.482 | 1.901 → 0.983 | 2.490 → 1.475 |
+
+Opt-in maximum position differences at 60 / 180 steps: fixed-heavy <1e-9 m; pile
+0.013918 / 0.004175 m; hub 0 / 0.074111 m; mixed-size <1e-9 m. The hub's later impact
+shows why early equivalence is insufficient and why this option remains off by default.
+All sampled positions remain finite and no capacity overflow occurs. Collision savings are
+clear in the expensive mixed-size case; smaller cases have mixed wall results, so no general
+FPS improvement is claimed. Timestamp quantization and shared load limit small timings.
+No older-device or three-destruction play-session validation yet. This branch is independent
+of #16/#17; these gains must not be added together without combined integration measurements.
+
 ## 2026-10-06 — Joints that hold a turn and bend for good: a rest rotation, yield, a bend limit, per-joint thresholds
 
 Why: three-destruction (`three-destruction/avbd`) builds falling building sections and hinges on

@@ -56,6 +56,17 @@ renderer.setAnimationLoop(() => {
   pairs, joints and colours grow on their own, through the existing `adapt()` readbacks.
 - `step()` advances one fixed step. `update(seconds)` runs the steps that time is owed, at
   most `maxSubsteps` (default 4).
+- For explicitly managed substeps, `step({ reuseManifolds: true })` skips new collision
+  detection and refreshes the preceding contact set's separation and warm-start data.
+  Call ordinary `step()` at the start of **every frame**, e.g. with `dt = 1/120`,
+  `world.step(); world.step({ reuseManifolds: true });` advances 1/60 s. `update()`
+  continues detecting on every step. This opt-in changes results: new impacts and changing
+  contact normals wait until the next detecting step. It is not continuous collision
+  detection; leave it off for fast projectiles or rapidly rotating contacts. Body/filter/
+  constraint rewrites and queued kinematic moves force fresh detection. Advanced callers
+  writing GPU buffers directly must request a detecting step themselves. The same option
+  is available on `GpuSolver3D.step`. During reuse, `readPairs()` and the `pairs` counter
+  retain the last detecting step's broadphase results; contact counts describe the current step.
 - `params`: `gravity` (a vector, default `[0, -9.81, 0]`), `dt`, `iterations`, and the solver's stiffness
   terms (`alpha`, `betaLin`, `betaAng`, `gamma`), with the paper's defaults.
 - `destroy()` releases the GPU buffers.

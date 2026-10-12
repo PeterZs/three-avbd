@@ -20,7 +20,7 @@ import { Manifold } from '../ref/manifold.ts';
 import { defaultParams, type Solver, type SolverParams } from '../ref/solver.ts';
 import {
   ARGS_ITEMS_3D, B_ANGVEL, B_INERTIAL_POS, B_INERTIAL_ROT, B_INITIAL_POS, B_INITIAL_ROT, B_MOMENT, B_POS, B_ROT, B_SIZE, B_VEL, BODY_FLOATS,
-  C_MANIFOLDS, CONTACT_WORDS, FLAG_FACE_BIAS, FLAG_MASS_PENALTY, FLAG_MATCH_NEAREST, FLAG_REUSE_CONTACTS, FLAG_START_AT_REST, J_C0_ANG, J_C0_LIN, J_LAM_ANG, K_LAM, K_PEN, K_RA, K_RB, M_GEO, MANIFOLD_WORDS, STICK_BIT,
+  C_MANIFOLDS, CONTACT_WORDS, FLAG_FACE_BIAS, FLAG_MASS_PENALTY, FLAG_MATCH_NEAREST, FLAG_REUSE_CONTACTS, FLAG_REUSE_MANIFOLDS, FLAG_START_AT_REST, J_C0_ANG, J_C0_LIN, J_LAM_ANG, K_LAM, K_PEN, K_RA, K_RB, M_GEO, MANIFOLD_WORDS, STICK_BIT,
   J_BREAK_BEND, J_LAM_LIN, J_PEN_ANG, J_PEN_LIN, J_RA, J_RB, J_REST, J_REST_START, J_YIELD, JOINT_FLOATS, PARAM_WORDS, PRELUDE_3D, SHAPE_BOX, SHAPE_HULL, SHAPE_SAIL, SHAPE_SPHERE, T_JOINT, T_SPRING,
   TOPOLOGY_ACCESSORS_3D,
 } from './layout.ts';
@@ -32,7 +32,19 @@ import { largestSmall } from './radii.ts';
 
 export { PHASES, type StepProfile };
 
+/** Options for an explicitly managed substep sequence. */
+export interface GpuStepOptions {
+  /**
+   * Retain the previous substep's contact set; refresh separation and warm-start values.
+   * Default false. Detect normally on the first substep of EVERY frame. New impacts and
+   * changed normals are not discovered until the next detecting step (this is not CCD).
+   */
+  reuseManifolds?: boolean;
+}
+
 export interface GpuCounters3D extends GpuCounters {
+  /** Broadphase pairs from the last detecting step, retained during manifold reuse. */
+  pairs: number;
   /** Contact pairs (manifolds) written by the last step. */
   manifolds: number;
 }
@@ -514,6 +526,7 @@ export class GpuSolver3D {
   private readonly refBuffer: GPUBuffer;
   /** Steps taken (the reuse bookkeeping's clock; starts at 1). */
   private stepCount = 0;
+  private manifoldsValid = false;
   private passBuffer: GPUBuffer | null = null;
   private passEntries = 0;
 
@@ -697,8 +710,9 @@ export class GpuSolver3D {
     make(refsWGSL, [L.refs], ['updateRefs']);
     // The hull narrowphase costs box scenes a few % of collision time (register pressure): it is
     // compiled when the first hull arrives (acquireHull). The layout binds the hull buffer anyway.
-    make(shaders.contacts ?? contactsWGSL, [L.contacts], ['hashInsert', 'narrowphase']);
-    this.contactShaders = { make: (code) => make(code, [L.contacts], ['hashInsert', 'narrowphase']), custom: !!shaders.contacts };
+    const contactEntries = ['hashInsert', 'narrowphase', ...(!shaders.contacts ? ['reuseManifolds'] : [])];
+    make(shaders.contacts ?? contactsWGSL, [L.contacts], contactEntries);
+    this.contactShaders = { make: (code) => make(code, [L.contacts], contactEntries), custom: !!shaders.contacts };
     make(makeTopologyWGSL(PRELUDE_3D, TOPOLOGY_ACCESSORS_3D), [L.topo], [
       'degreeJoints', 'degreeContacts', 'fillJoints', 'fillContacts', 'sortAdjacency',
       'colorCompact', 'colorMark', 'colorRoundAB', 'colorRoundBA', 'colorCount', 'colorStarts', 'colorScatter',
@@ -733,6 +747,7 @@ export class GpuSolver3D {
    * copied over and the counters are left alone, so warm starts survive the reallocation.
    */
   private allocateContacts(requestedContacts: number, requestedPairs: number, requestedManifolds: number): void {
+    this.manifoldsValid = false;
     const d = this.device;
     const maxBinding = d.limits.maxStorageBufferBindingSize;
     const capacity = Math.min(Math.ceil(requestedContacts), Math.floor(maxBinding / (CONTACT_WORDS * 4)));
@@ -805,6 +820,7 @@ export class GpuSolver3D {
 
   /** Pack reference bodies into GPU records and upload them in one write, starting at `first`. */
   private writeBodies(first: number, bodies: Rigid[]): void {
+    this.manifoldsValid = false;
     const f = new Float32Array(Math.max(bodies.length, 1) * BODY_FLOATS);
     bodies.forEach((b, k) => {
       const info = this.pack(b, f, k * BODY_FLOATS, this.bodies[first + k]?.hull);
@@ -821,6 +837,7 @@ export class GpuSolver3D {
    * voxels at once (a tower's storeys falling); building a Rigid for each took 80 ms.
    */
   rewriteFixed(indices: ArrayLike<number>, positions: ArrayLike<number>, size: ArrayLike<number>, friction: number, rotations?: ArrayLike<number>): void {
+    this.manifoldsValid = false;
     if (!indices.length) return;
     const template = new Float32Array(BODY_FLOATS);
     // What a Rigid of density 0 packs to (initial and inertial poses start at rest, as there)
@@ -930,6 +947,7 @@ export class GpuSolver3D {
 
   /** Bodies a and b (a joint's, slot `slot`) no longer collide, from the next step. */
   private noCollide(a: number, b: number, slot: number): void {
+    this.manifoldsValid = false;
     if (a < 0) return;
     this.pendingEntries.push([Math.max(a, b), Math.min(a, b), slot]);
     this.noCollideDirty = true;
@@ -1254,6 +1272,7 @@ export class GpuSolver3D {
    * are ignored.
    */
   releaseJoints(slots: ArrayLike<number>): void {
+    this.manifoldsValid = false;
     const order = [...new Set(Array.from(slots))].filter((slot) => slot < this.jointCount && this.info[slot * 4] !== T_NONE).sort((x, y) => x - y);
     if (!order.length) return;
     for (const slot of order) {
@@ -1295,6 +1314,7 @@ export class GpuSolver3D {
    * other collides with. By default every body is in every group and collides with all.
    */
   setFilters(indices: ArrayLike<number>, groups: ArrayLike<number>, collidesWith: ArrayLike<number>): void {
+    this.manifoldsValid = false;
     for (let k = 0; k < indices.length; ) {
       let e = k + 1;
       while (e < indices.length && indices[e] === indices[e - 1] + 1) e++;
@@ -1312,6 +1332,7 @@ export class GpuSolver3D {
 
   /** Stop a joint acting: zero its penalties, stiffness and lambdas (keeps fracture/torque arm). */
   disableConstraint(slot: number): void {
+    this.manifoldsValid = false;
     this.device.queue.writeBuffer(this.jointBuffer, (slot * JOINT_FLOATS + J_PEN_LIN) * 4, new Float32Array(8));
     this.device.queue.writeBuffer(this.jointBuffer, (slot * JOINT_FLOATS + J_LAM_LIN) * 4, new Float32Array(3));
     this.device.queue.writeBuffer(this.jointBuffer, (slot * JOINT_FLOATS + J_LAM_ANG) * 4, new Float32Array(3));
@@ -1324,7 +1345,7 @@ export class GpuSolver3D {
     if (this.timing && !this.timingBusy) this.timingCallback = callback;
   }
 
-  private writeParams(): void {
+  private writeParams(reuseManifolds = false): void {
     const p = this.params;
     const cap = this.bodyCapacity;
     const buf = new ArrayBuffer(PARAM_WORDS * 4);
@@ -1336,7 +1357,7 @@ export class GpuSolver3D {
     f[3] = p.betaAng;
     f[4] = p.gamma;
     f[5] = p.alpha;
-    u[6] = (p.matchNearest ? FLAG_MATCH_NEAREST : 0) | (p.faceBias ? FLAG_FACE_BIAS : 0) | (p.reuseContacts ? FLAG_REUSE_CONTACTS : 0) | (p.startAtRest ? FLAG_START_AT_REST : 0) | (p.massPenalty ? FLAG_MASS_PENALTY : 0);
+    u[6] = (p.matchNearest ? FLAG_MATCH_NEAREST : 0) | (p.faceBias ? FLAG_FACE_BIAS : 0) | (p.reuseContacts ? FLAG_REUSE_CONTACTS : 0) | (p.startAtRest ? FLAG_START_AT_REST : 0) | (p.massPenalty ? FLAG_MASS_PENALTY : 0) | (reuseManifolds ? FLAG_REUSE_MANIFOLDS : 0);
     u[7] = this.bodyCount;
     u[8] = this.jointCount;
     u[9] = this.colorCap;
@@ -1392,7 +1413,8 @@ export class GpuSolver3D {
     this.device.queue.writeBuffer(this.passBuffer!, 0, data);
   }
 
-  step(): void {
+  step(options: GpuStepOptions = {}): void {
+    const reuseManifolds = !!options.reuseManifolds && this.manifoldsValid && !!this.pipes.reuseManifolds;
     if (this.radiiDirty || this.noCollideDirty) this.uploadStatics();
     const p = this.params;
     if (this.fixedColors) {
@@ -1400,7 +1422,7 @@ export class GpuSolver3D {
       this.colorCap = Math.max(1, ...this.fixedColors.map((c) => (c === NO_COLOR ? 0 : c + 1)));
     }
     this.stepCount++;
-    this.writeParams();
+    this.writeParams(reuseManifolds);
     this.writePassConstants(p.iterations, p.alpha);
 
     const cur = this.parity;
@@ -1408,8 +1430,10 @@ export class GpuSolver3D {
     const N = this.bodyCount;
     const J = this.jointCount;
     const encoder = this.device.createCommandEncoder({ label: 'avbd3d step' });
-    encoder.clearBuffer(this.gridBuffer, 0, (2 * this.tableSize + 1) * 4);
-    encoder.clearBuffer(this.tableBuffer);
+    if (!reuseManifolds) {
+      encoder.clearBuffer(this.gridBuffer, 0, (2 * this.tableSize + 1) * 4);
+      encoder.clearBuffer(this.tableBuffer);
+    }
     encoder.clearBuffer(this.adjBuffer!, 0, (2 * cap + 1) * 4);
 
     const timed = this.timingCallback !== null && this.timing !== null;
@@ -1443,13 +1467,17 @@ export class GpuSolver3D {
     run('beginFrame', G.broad, 1);
     if (p.reuseContacts) run('updateRefs', G.refs, groups(N));
     run('argsPrev', G.args, 1);
-    runIndirect('hashInsert', G.contacts[cur], IA_PREV);
-    run('gridCount', G.broad, groups(N));
-    this.gridScan.encode(pass);
-    run('gridScatter', G.broad, groups(N));
-    run('findPairs', G.broad, groups(N));
-    run('argsPairs', G.args, 1);
-    runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
+    if (reuseManifolds) {
+      runIndirect('reuseManifolds', G.contacts[cur], IA_PREV);
+    } else {
+      runIndirect('hashInsert', G.contacts[cur], IA_PREV);
+      run('gridCount', G.broad, groups(N));
+      this.gridScan.encode(pass);
+      run('gridScatter', G.broad, groups(N));
+      run('findPairs', G.broad, groups(N));
+      run('argsPairs', G.args, 1);
+      runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
+    }
     run('argsContacts', G.args, 1);
 
     // Adjacency
@@ -1508,6 +1536,7 @@ export class GpuSolver3D {
     }
     this.device.queue.submit([encoder.finish()]);
     this.parity = 1 - cur;
+    this.manifoldsValid = true;
 
     if (timed) {
       const callback = this.timingCallback!;
@@ -1582,7 +1611,7 @@ export class GpuSolver3D {
     return out;
   }
 
-  /** Pairs found by the last step's broadphase (bodyA > bodyB), unordered. */
+  /** Pairs from the last detecting step (bodyA > bodyB), unordered; retained during manifold reuse. */
   async readPairs(): Promise<Uint32Array> {
     const { pairs } = await this.readCounters();
     return new Uint32Array(await this.read(this.pairBuffer, Math.min(pairs, this.pairCapacity) * 8));

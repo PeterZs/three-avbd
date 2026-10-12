@@ -10,7 +10,7 @@ export { Rigid } from '../avbd3d/ref/body.ts';
 export { sphere, hull } from '../avbd3d/shapes.ts';
 // Hull shapes for `hull` bodies (convexHull is also on the main entry)
 export { convexHull, hullFromTriangles, MAX_HULL_VERTICES, type HullShape } from '../avbd3d/hull.ts';
-export type { GpuParams3D, GpuSolverOptions, GpuCounters3D, GpuContact, JointSpec } from '../avbd3d/gpu/solver.ts';
+export type { GpuStepOptions, GpuParams3D, GpuSolverOptions, GpuCounters3D, GpuContact, JointSpec } from '../avbd3d/gpu/solver.ts';
 // A joint record read back (GpuSolver3D.readJoints) decoded: the forces it carries, whether it
 // broke, the rest it holds and how far it has bent
 export { decodeJoint, type JointState } from '../avbd3d/gpu/joints.ts';
