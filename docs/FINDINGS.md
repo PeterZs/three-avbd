@@ -2,6 +2,15 @@
 
 Measured results that drive design decisions. Newest first. Each entry says how it was measured.
 
+## 2026-10-12 — Raw readback integration for #16
+
+three-destruction assembles counters from its own batched GPU readback. Without forwarding
+`tailBodies`, `adapt()` deliberately keeps the conservative scheduling hint. Export
+`C_TAIL_BODIES` from the advanced entry so raw-buffer consumers can forward the optional
+counter without hardcoding an offset. Older consumers remain valid; omitting it affects
+performance only. The full gate passes: 81 CPU, 88 GPU (zero skips), typecheck and both
+builds. Downstream activation and play-session measurements are recorded in three-destruction.
+
 ## 2026-10-12 — Combined solver integration (#14/#16/#17/#15)
 
 All required gate components pass together: typecheck, 81 CPU tests, 88 Dawn GPU tests
