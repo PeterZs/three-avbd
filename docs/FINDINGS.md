@@ -1352,3 +1352,35 @@ medians across three runs; M4 Max with shared GPU load (load 6.94, GPU utilizati
 The dense fallback wall-time result is mixed with GPU time under load; no gain is claimed
 for it. GPU timestamps are quantized (~0.0655 ms). The real destruction session and older
 hardware still need measurements before extrapolating these targeted gains.
+
+## Fixed-body broadphase probes (#14, 2026-10-12)
+
+Fixed invocations now return before loading their shape or scanning grid neighbors. A dynamic
+small body owns its pairs with fixed small bodies regardless of index; the large-body path owns
+fixed-large pairs, and a separate pass handles small fixed versus large dynamic bodies when needed.
+The saved WIP's compacted probe list was removed: it added atomics, a buffer region and an argument
+dispatch without a demonstrated benefit in these tests. There is no new public option or buffer layout.
+three-destruction implements sleep by rewriting a body as fixed with zero solver mass, restoring it
+on wake; this change covers that representation, not a new native sleeping API.
+
+Validation: all gate components passed (81 CPU tests, 76 Dawn GPU tests, zero skips; typecheck,
+Vite build and library build). GPU files ran sequentially with `--test-concurrency=1`; Node rejects
+that flag in NODE_OPTIONS, so the gate's components were invoked explicitly. The new regression
+covers all small/large and fixed/dynamic pair combinations, both index orders, and sleep/wake rewrites.
+
+`node --experimental-transform-types scripts/compare3d-gpu.ts <baseline-checkout>` compares each
+scene sequentially against main 9b9c27b on the same device. Three runs produced identical full
+body-state buffers after 60 steps, with no overflow, for 10,000 fixed pieces plus 512 dynamic pieces,
+a 125-body pile, and a 32-joint hub. Median timings (M4 Max, Dawn, other GPU work active; initial
+load 12.92, GPU utilization 59%):
+
+| Scene | Wall ms/step baseline → candidate | GPU collision ms baseline → candidate | GPU total ms baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Fixed-heavy | 0.989 → 0.949 | 0.131 → 0.131 | 0.590 → 0.590 |
+| Pile | 0.917 → 0.912 | 0.131 → 0.131 | 0.655 → 0.655 |
+| Joint hub | 0.941 → 0.916 | 0.066 → 0.066 | 0.590 → 0.590 |
+
+GPU timestamps are quantized at about 0.0655 ms here. The small wall-time changes under shared
+load are not evidence of a robust FPS gain; representative hull-heavy and target-device measurements
+remain necessary. This establishes pair coverage and state equivalence for the measured scenes,
+not universal cross-device bitwise determinism. No version bump or publication was performed.

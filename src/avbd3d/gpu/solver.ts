@@ -700,7 +700,7 @@ export class GpuSolver3D {
       for (const entryPoint of entries) this.pipes[entryPoint] = d.createComputePipeline({ label: entryPoint, layout, compute: { module, entryPoint } });
     };
     const L = this.layouts;
-    make(broadphaseWGSL, [L.broad], ['beginFrame', 'gridCount', 'gridScatter', 'findPairs']);
+    make(broadphaseWGSL, [L.broad], ['beginFrame', 'gridCount', 'gridScatter', 'findPairs', 'findFixedLarge']);
     make(refsWGSL, [L.refs], ['updateRefs']);
     // The hull narrowphase costs box scenes a few % of collision time (register pressure): it is
     // compiled when the first hull arrives (acquireHull). The layout binds the hull buffer anyway.
@@ -1477,6 +1477,7 @@ export class GpuSolver3D {
     this.gridScan.encode(pass);
     run('gridScatter', G.broad, groups(N));
     run('findPairs', G.broad, groups(N));
+    if (this.large.some(i => this.bodies[i]?.dynamic)) run('findFixedLarge', G.broad, groups(N));
     run('argsPairs', G.args, 1);
     runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
     run('argsContacts', G.args, 1);
