@@ -487,8 +487,8 @@ export class GpuSolver3D {
   primalLanes: [number, number, number] = [2 ** 31, 2 ** 15, 2 ** 12];
   /** Encode each phase as its own compute pass even when not profiling. */
   splitPasses = false;
-  /** Fuse tail colours in small active scenes, retaining their solve order. */
-  fuseSparseColors = true;
+  /** Experimental tail fusion; opt in only when replay equivalence is not required. */
+  fuseSparseColors = false;
   private useSparseColors = false;
   private tailBodies = Infinity;
   private shrinkVotes = 0;
