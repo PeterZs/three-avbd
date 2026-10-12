@@ -41,3 +41,35 @@ gpuTest('fine/coarse/large pairs match brute force across sleep, wake and resize
     }
   } finally { gpu.destroy(); }
 });
+
+
+gpuTest('dynamic-only probes preserve every fixed/fine/coarse ownership direction', async device => {
+  const ref = new Solver();
+  const expected: string[] = [];
+  for (const coarseA of [false, true]) for (const coarseB of [false, true]) {
+    for (const movingA of [false, true]) for (const movingB of [false, true]) {
+      const start = ref.bodies.length;
+      for (const [coarse, moving, dx] of [[coarseA, movingA, 0], [coarseB, movingB, 0.1]] as const) {
+        const size = coarse ? 4 : 0.4;
+        new Rigid(ref, [size, size, size], moving ? 1 : 0, 0.5, [start * 10 + dx, 0, 0]);
+      }
+      if (movingA || movingB) expected.push(`${start + 1}-${start}`);
+    }
+  }
+  // More than 64 coarse bodies keep that level out of the large-body list;
+  // many fine movers ensure a distinct fine level even with a few coarse movers.
+  for (let i = 0; i < 160; i++) new Rigid(ref, [4, 4, 4], 0, 0.5, [i * 5, 1000, 0]);
+  for (let i = 0; i < 1000; i++) new Rigid(ref, [0.4, 0.4, 0.4], 1, 0.5, [i, 2000, 0]);
+  const gpu = new GpuSolver3D(device, ref, { spatialSort: false });
+  gpu.params.gravity = 0; gpu.params.iterations = 0;
+  try {
+    gpu.step();
+    assert.ok(Reflect.get(gpu, 'fineCellSize') < Reflect.get(gpu, 'cellSize'));
+    assert.equal(Reflect.get(gpu, 'coarseDynamic'), true);
+    const raw = await gpu.readPairs(), pairs: string[] = [];
+    for (let k = 0; k < raw.length; k += 2) pairs.push(`${raw[k]}-${raw[k + 1]}`);
+    assert.equal(new Set(pairs).size, pairs.length);
+    assert.deepEqual(pairs.sort(), expected.sort());
+    assert.equal((await gpu.readCounters()).overflow, 0);
+  } finally { gpu.destroy(); }
+});

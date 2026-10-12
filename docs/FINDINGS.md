@@ -1311,8 +1311,9 @@ Revisit the GPU default (post-stab vs α) with these metrics in Stage 2.
 When held slabs enlarge the existing grid, moving-body radii now select an additional fine
 level. Similarly sized fixed pieces share that level; coarse pieces retain the existing
 cell size. Both levels share the hash table and scan buffers, with level-salted hashes and
-explicit level/cell checks. Same-level pairs belong to the higher index; cross-level pairs
-belong to the finer body regardless of index or mass. Both scans need only 27 cells.
+explicit level/cell checks. Within a level, dynamic/dynamic pairs belong to the higher index
+and dynamic/fixed pairs to the dynamic body. Cross-level pairs belong to the finer body;
+fine fixed bodies use the auxiliary pass when coarse movers exist. Each scan needs only 27 cells.
 The original large-body list remains for extreme sizes. With no useful size separation,
 the grid stays at one level. Radius or dynamic/fixed changes refresh the classification.
 
@@ -1339,3 +1340,88 @@ under load; the similar-size case is slower in wall time and differs by one time
 in collision, with unchanged GPU total. No universal speedup or older-hardware claim.
 The comparison script is reproducible with a baseline checkout path; the original CPU
 capacity estimate stays conservative and unchanged. No npm version/publication change.
+
+## Bounded color-tail dispatches (#16, 2026-10-12)
+
+For small active sets, colors 16 and above now run in one workgroup, sequentially by color
+and in chunks within each color. Storage barriers preserve Gauss-Seidel color order; no
+Jacobi update or color relabeling is introduced. The host omits the individual tail
+commands: at cap 64, 14 iterations, primal dispatch calls fall from 896 to 238. Pass
+constants are shared across iterations and uploaded only when alpha changes or the buffer
+grows (232,960 bytes per step previously, versus 16,640 once at cap 64).
+
+The first prototype left empty indirect commands in place; independent review correctly
+identified that this left the main overhead. The next prototype exposed a dense-tail
+regression (1,000 bodies serialized: GPU solve 2.818 -> 9.961 ms). The final policy fuses
+at most 128 active bodies, or at most 1,024 active bodies with a recent tail count <=128.
+Fixed-color validation uses the exact CPU count. Other scenes use the count supplied to
+`adapt`, conservatively starting on the parallel path. A stale hint can temporarily cost
+performance, but the fused kernel always processes all current colors and chunks. Large
+active sets and dense tails retain parallel dispatches; custom solve shaders also retain
+the original path. `fuseSparseColors = false` disables fusion for comparison.
+
+The existing cap already shrinks after three quiet readbacks; regression coverage verifies
+64 -> 4 and regrowth on clashes. This does not solve pathological graph-coloring clashes
+or guarantee a minimum palette. Default coloring and color order are unchanged.
+
+Validation: 81 CPU tests and the full 77-test GPU gate passed, plus the subsequently added
+stale-hint test (78 distinct GPU tests, zero skips), typecheck, Vite build and library build.
+New coverage compares complete states for fusion, multi-chunk tails, >1,024-body fallback,
+alpha/iteration changes, and an underestimated hint with dynamic coloring. Three baseline
+comparisons against main 9b9c27b produced zero differing body-state values after 60 steps
+in all five scenes, including alpha/iteration/cap changes.
+
+`node --experimental-transform-types scripts/compare3d-gpu.ts <baseline-checkout>` runs
+sequentially on one Dawn device. These are deliberately cap-64 stress measurements, not
+normal adaptive-demo FPS claims. 120-step wall time and nine GPU samples per scene,
+medians across three runs; M4 Max with shared GPU load (load 6.94, GPU utilization 49%):
+
+| Scene | Wall ms/step old -> new | GPU solve ms old -> new |
+| --- | ---: | ---: |
+| 10k fixed + 512 moving | 10.085 -> 2.928 | 2.753 -> 0.852 |
+| 125-body pile | 9.616 -> 2.757 | 2.621 -> 0.918 |
+| 32-joint hub | 9.956 -> 3.137 | 3.277 -> 0.918 |
+| Hub with sparse high color labels | 9.840 -> 2.788 | 4.850 -> 2.032 |
+| 1k bodies in one high-label bucket (parallel fallback) | 9.845 -> 10.568 | 3.736 -> 3.408 |
+
+The dense fallback wall-time result is mixed with GPU time under load; no gain is claimed
+for it. GPU timestamps are quantized (~0.0655 ms). The real destruction session and older
+hardware still need measurements before extrapolating these targeted gains.
+
+## Fixed-body broadphase probes (#14, 2026-10-12)
+
+Fixed invocations in the primary probe pass return before loading their shape or scanning
+grid neighbors. Combined with #17, the auxiliary pass scans coarse neighbors for fine fixed
+bodies only when coarse movers exist. A dynamic
+small body owns its pairs with fixed small bodies regardless of index; the large-body path owns
+fixed-large pairs, and a separate pass handles small fixed versus large dynamic bodies when needed.
+The saved WIP's compacted probe list was removed: it added atomics, a buffer region and an argument
+dispatch without a demonstrated benefit in these tests. There is no new public option or buffer layout.
+three-destruction implements sleep by rewriting a body as fixed with zero solver mass, restoring it
+on wake; this change covers that representation, not a new native sleeping API.
+
+Validation: all gate components passed (81 CPU tests, 76 Dawn GPU tests, zero skips; typecheck,
+Vite build and library build). GPU files ran sequentially with `--test-concurrency=1`; Node rejects
+that flag in NODE_OPTIONS, so the gate's components were invoked explicitly. The new regression
+covers all small/large and fixed/dynamic pair combinations, both index orders, and sleep/wake rewrites.
+
+`node --experimental-transform-types scripts/compare3d-gpu.ts <baseline-checkout>` compares each
+scene sequentially against main 9b9c27b on the same device. Three runs produced identical full
+body-state buffers after 60 steps, with no overflow, for 10,000 fixed pieces plus 512 dynamic pieces,
+a 125-body pile, and a 32-joint hub. Median timings (M4 Max, Dawn, other GPU work active; initial
+load 12.92, GPU utilization 59%):
+
+| Scene | Wall ms/step baseline → candidate | GPU collision ms baseline → candidate | GPU total ms baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Fixed-heavy | 0.989 → 0.949 | 0.131 → 0.131 | 0.590 → 0.590 |
+| Pile | 0.917 → 0.912 | 0.131 → 0.131 | 0.655 → 0.655 |
+| Joint hub | 0.941 → 0.916 | 0.066 → 0.066 | 0.590 → 0.590 |
+
+GPU timestamps are quantized at about 0.0655 ms here. The small wall-time changes under shared
+load are not evidence of a robust FPS gain; representative hull-heavy and target-device measurements
+remain necessary. This establishes pair coverage and state equivalence for the measured scenes,
+not universal cross-device bitwise determinism. No version bump or publication was performed.
+
+Combined #14/#16/#17 integration: all gate components passed (81 CPU, 81 GPU, zero skips),
+with an explicit fine/coarse fixed/dynamic ownership regression. Six cap-stress comparison
+scenes against pre-optimization main retain bit-identical complete body states at 60 steps.
