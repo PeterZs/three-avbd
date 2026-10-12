@@ -52,7 +52,7 @@ ${PRELUDE_3D}
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> bodies: array<Body>;
-// Grid: bucketStart[tableMask + 2] | cursor[tableMask + 1] | sorted[bodies] | cell[3 * bodies] | probes[bodies]
+// Grid: bucketStart[tableMask + 2] | cursor[tableMask + 1] | sorted[bodies] | cell[3 * bodies]
 @group(0) @binding(2) var<storage, read_write> grid: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> pairs: array<vec2u>;
 @group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>>;
@@ -73,7 +73,6 @@ fn beginFrame() {
   atomicStore(&counters[C_OVERFLOW], 0u);
   atomicStore(&counters[C_CLASHES], 0u);
   atomicStore(&counters[C_NUM_COLORS], 0u);
-  atomicStore(&counters[C_PROBES], 0u);
 }
 
 fn radius(i: u32) -> f32 {
@@ -95,10 +94,7 @@ fn cellHash(c: vec3i) -> u32 {
 @compute @workgroup_size(64)
 fn gridCount(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
-  if (i >= params.bodyCount) { return; }
-  // Dynamic bodies probe the grid (findPairs); fixed (and sleeping) ones are only found
-  if (bodies[i].size.w > 0.0) { atomicStore(&grid[params.gridProbesOffset + atomicAdd(&counters[C_PROBES], 1u)], i); }
-  if (isLarge(i)) { return; }
+  if (i >= params.bodyCount || isLarge(i)) { return; }
   let c = cellOf(i);
   for (var k = 0u; k < 3u; k++) { atomicStore(&grid[params.gridCellOffset + 3u * i + k], bitcast<u32>(c[k])); }
   atomicAdd(&grid[cellHash(c)], 1u);
@@ -225,15 +221,15 @@ fn testPair(P: Probe, j: u32) {
 }
 
 /**
- * One thread per dynamic body (gridCount's list): a pair with a fixed body (or a sleeping one,
- * fixed in the solver) is emitted from its dynamic body, so the fixed bodies, most of a settled
- * scene, start no thread and scan nothing (fixed-fixed pairs never collide). Their pairs with
+ * Only dynamic bodies probe: a pair with a fixed body (or one sleeping as fixed) is emitted
+ * from its dynamic body. Fixed invocations return before loading shapes or scanning the grid,
+ * without a probe-list allocation, atomic append or indirect-argument dispatch. Their pairs with
  * the large dynamic bodies, which scan no grid, are findFixedLarge's.
  */
 @compute @workgroup_size(64)
 fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= min(atomicLoad(&counters[C_PROBES]), params.bodyCount)) { return; }
-  let i = atomicLoad(&grid[params.gridProbesOffset + gid.x]);
+  let i = gid.x;
+  if (i >= params.bodyCount || bodies[i].size.w <= 0.0) { return; }
   let small = !isLarge(i);
   let P = probeOf(i);
   if (small) {

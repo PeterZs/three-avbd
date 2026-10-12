@@ -241,8 +241,6 @@ export const makeArgsWGSL = (
     capacity: string;
     /** WGSL defining fn colorThreads(bodies: u32) -> u32, when a colour's primal runs several threads per body. */
     colorThreads?: string;
-    /** More argument kernels of the dimension's own (they may use setArgs). */
-    extra?: string;
   } = { counter: 'C_CONTACTS', prevCounter: 'C_PREV_CONTACTS', capacity: 'params.contactCapacity' },
 ): string => /* wgsl */ `
 ${prelude}
@@ -281,7 +279,6 @@ fn argsColors(@builtin(local_invocation_id) lid: vec3u) {
   let c = lid.x;
   setArgs(IA_COLOR + 3u * c, colorThreads(color[params.colorStartOffset + c + 1u] - color[params.colorStartOffset + c]));
 }
-${items.extra ?? ''}
 `;
 
 export const argsWGSL = makeArgsWGSL(PRELUDE);

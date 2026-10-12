@@ -10,7 +10,7 @@
 // Scenes are built with the 3D CPU reference (../ref) and loaded from it. The host keeps what
 // the CPU owns: body shapes (broadphase configuration), joint endpoints and no-collide pairs.
 
-import { makeArgsWGSL, BIG, COLOR_WG, C_CLASHES, C_CONTACTS, C_NUM_COLORS, C_OVERFLOW, C_PAIRS, COUNTER_WORDS, IA_COLOR, IA_CONSTRAINTS, IA_CONTACTS, IA_PAIRS, IA_PREV, MAX_COLORS, NO_COLOR, PASS_STRIDE, T_NONE, WORKGROUP_SIZE } from '../../avbd2d/gpu/layout.ts';
+import { makeArgsWGSL, ARGS_WORDS, BIG, COLOR_WG, C_CLASHES, C_CONTACTS, C_NUM_COLORS, C_OVERFLOW, C_PAIRS, COUNTER_WORDS, IA_COLOR, IA_CONSTRAINTS, IA_CONTACTS, IA_PAIRS, IA_PREV, MAX_COLORS, NO_COLOR, PASS_STRIDE, T_NONE, WORKGROUP_SIZE } from '../../avbd2d/gpu/layout.ts';
 import { PrefixScan } from '../../avbd2d/gpu/scan.ts';
 import { type GpuCounters, PHASES, type StepProfile } from '../../avbd2d/gpu/layout.ts';
 import { makeTopologyWGSL } from '../../avbd2d/gpu/wgsl-topology.ts';
@@ -22,7 +22,7 @@ import {
   ARGS_ITEMS_3D, B_ANGVEL, B_INERTIAL_POS, B_INERTIAL_ROT, B_INITIAL_POS, B_INITIAL_ROT, B_MOMENT, B_POS, B_ROT, B_SIZE, B_VEL, BODY_FLOATS,
   C_MANIFOLDS, CONTACT_WORDS, FLAG_FACE_BIAS, FLAG_MASS_PENALTY, FLAG_MATCH_NEAREST, FLAG_REUSE_CONTACTS, FLAG_START_AT_REST, J_C0_ANG, J_C0_LIN, J_LAM_ANG, K_LAM, K_PEN, K_RA, K_RB, M_GEO, MANIFOLD_WORDS, STICK_BIT,
   J_BREAK_BEND, J_LAM_LIN, J_PEN_ANG, J_PEN_LIN, J_RA, J_RB, J_REST, J_REST_START, J_YIELD, JOINT_FLOATS, PARAM_WORDS, PRELUDE_3D, SHAPE_BOX, SHAPE_HULL, SHAPE_SAIL, SHAPE_SPHERE, T_JOINT, T_SPRING,
-  TOPOLOGY_ACCESSORS_3D, ARGS_WORDS_3D, IA_PROBES,
+  TOPOLOGY_ACCESSORS_3D,
 } from './layout.ts';
 import { hullOf, isSail, isSphere, type HullShape } from '../shapes.ts';
 import { rotate, vec3 } from '../ref/math.ts';
@@ -582,9 +582,9 @@ export class GpuSolver3D {
 
     const cap = this.bodyCapacity;
     this.tableSize = pow2AtLeast(2 * cap);
-    this.gridBuffer = device.createBuffer({ label: 'grid 3d', size: (2 * this.tableSize + 1 + 5 * cap) * 4, usage: storageUsage() });
+    this.gridBuffer = device.createBuffer({ label: 'grid 3d', size: (2 * this.tableSize + 1 + 4 * cap) * 4, usage: storageUsage() });
     this.counterBuffer = device.createBuffer({ label: 'counters', size: COUNTER_WORDS * 4, usage: storageUsage() });
-    this.argsBuffer = device.createBuffer({ label: 'indirect args', size: ARGS_WORDS_3D * 4, usage: storageUsage() | GPUBufferUsage.INDIRECT });
+    this.argsBuffer = device.createBuffer({ label: 'indirect args', size: ARGS_WORDS * 4, usage: storageUsage() | GPUBufferUsage.INDIRECT });
     this.colorGroups = Math.ceil(cap / COLOR_WG);
     this.colorBuffer = device.createBuffer({ label: 'colours', size: (3 * cap + 65 + MAX_COLORS * this.colorGroups + 1) * 4, usage: storageUsage() });
     this.paramsBuffer = device.createBuffer({ label: 'params 3d', size: PARAM_WORDS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -704,7 +704,7 @@ export class GpuSolver3D {
       'colorCompact', 'colorMark', 'colorRoundAB', 'colorRoundBA', 'colorCount', 'colorStarts', 'colorScatter',
     ]);
     make(shaders.solve ?? solveWGSL, [L.solve, L.pass], ['warmStartJoints', 'warmStartBodies', 'primal', 'dual', 'updateVelocities']);
-    make(makeArgsWGSL(PRELUDE_3D, ARGS_ITEMS_3D), [L.args], ['argsPrev', 'argsPairs', 'argsContacts', 'argsColors', 'argsProbes']);
+    make(makeArgsWGSL(PRELUDE_3D, ARGS_ITEMS_3D), [L.args], ['argsPrev', 'argsPairs', 'argsContacts', 'argsColors']);
   }
 
   private allocateJoints(capacity: number): void {
@@ -1319,12 +1319,6 @@ export class GpuSolver3D {
 
   // --- Step ------------------------------------------------------------------------------------
 
-  /** Whether a large body (tested brute-force) is dynamic: its pairs with small fixed ones need findFixedLarge. */
-  private largeDynamic(): boolean {
-    for (const l of this.large) if (this.bodies[l]?.dynamic) return true;
-    return false;
-  }
-
   /** Time the next step's phases on the GPU (timestamp queries), if supported and not busy. */
   profileNextStep(callback: (profile: StepProfile) => void): void {
     if (this.timing && !this.timingBusy) this.timingCallback = callback;
@@ -1371,7 +1365,6 @@ export class GpuSolver3D {
     u[31] = log2(this.primalLanes[0]) | (log2(this.primalLanes[1]) << 8) | (log2(this.primalLanes[2]) << 16);
     f.set([p.windSpeed * Math.cos(p.windAngle), p.windSpeed * Math.sin(p.windAngle), 0, p.windPressure, p.windGust], 32);
     f.set([p.up[0], p.up[1], p.up[2], 0], 40);
-    u[44] = 2 * this.tableSize + 1 + 4 * cap; // gridProbesOffset
     this.device.queue.writeBuffer(this.paramsBuffer, 0, buf);
   }
 
@@ -1454,9 +1447,8 @@ export class GpuSolver3D {
     run('gridCount', G.broad, groups(N));
     this.gridScan.encode(pass);
     run('gridScatter', G.broad, groups(N));
-    run('argsProbes', G.args, 1);
-    runIndirect('findPairs', G.broad, IA_PROBES);
-    if (this.largeDynamic()) run('findFixedLarge', G.broad, groups(N));
+    run('findPairs', G.broad, groups(N));
+    if (this.large.some(i => this.bodies[i]?.dynamic)) run('findFixedLarge', G.broad, groups(N));
     run('argsPairs', G.args, 1);
     runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
     run('argsContacts', G.args, 1);
