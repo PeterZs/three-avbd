@@ -42,7 +42,7 @@ fn jointActive(j: u32) -> bool {
  * 2D, a contact pair in 3D; ids.xy = bodies), topoCount(), topoSecondary(u32) (what tells
  * one pair's records apart), dynamicBody(i32) and jointActive(u32).
  */
-export const makeTopologyWGSL = (prelude: string, accessors: string): string => /* wgsl */ `
+export const makeTopologyWGSL = (prelude: string, accessors: string, colorStats = ''): string => /* wgsl */ `
 ${prelude}
 ${accessors}
 
@@ -308,6 +308,7 @@ fn colorStarts(@builtin(local_invocation_id) lid: vec3u) {
   atomicStore(&color[params.colorStartOffset + c], atomicLoad(&color[params.colorHistOffset + c * params.colorGroups]));
   if (c == 0u) {
     atomicStore(&color[params.colorStartOffset + MAX_COLORS], atomicLoad(&color[params.colorHistOffset + MAX_COLORS * params.colorGroups]));
+    ${colorStats}
   }
 }
 

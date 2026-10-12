@@ -323,12 +323,34 @@ var<workgroup> partials: array<Acc, 32>;
  */
 @compute @workgroup_size(64)
 fn primal(@builtin(local_invocation_id) lid: vec3u, @builtin(workgroup_id) wid: vec3u) {
-  let start = color[params.colorStartOffset + pc.color];
-  let count = color[params.colorStartOffset + pc.color + 1u] - start;
+  primalColor(pc.color, lid.x, wid.x);
+}
+
+// All work stays in one workgroup, including buckets larger than one chunk. Colours
+// remain ordered; independent bodies within a colour can be solved chunk by chunk.
+var<workgroup> sparseThreads: u32;
+@compute @workgroup_size(64)
+fn primalSparse(@builtin(local_invocation_id) lid: vec3u) {
+  for (var c = SPARSE_COLOR_START; c < params.colorCap; c++) {
+    if (lid.x == 0u) {
+      let count = color[params.colorStartOffset + c + 1u] - color[params.colorStartOffset + c];
+      sparseThreads = count * lanesFor(count);
+    }
+    let threads = workgroupUniformLoad(&sparseThreads);
+    for (var chunk = 0u; chunk < groupsFor(threads); chunk++) {
+      primalColor(c, lid.x, chunk);
+    }
+    storageBarrier();
+  }
+}
+
+fn primalColor(c: u32, local: u32, group: u32) {
+  let start = color[params.colorStartOffset + c];
+  let count = color[params.colorStartOffset + c + 1u] - start;
   let lanes = lanesFor(count);
-  let slot = lid.x / lanes;
-  let lane = lid.x % lanes;
-  let k = wid.x * (64u / lanes) + slot;
+  let slot = local / lanes;
+  let lane = local % lanes;
+  let k = group * (64u / lanes) + slot;
   let live = k < count;
   var i = 0u;
   var acc: Acc;

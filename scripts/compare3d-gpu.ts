@@ -14,7 +14,8 @@ const load = async (dir: string) => {
   return { Solver, Rigid, GpuSolver3D };
 };
 const baseline = await load(resolve(process.argv[2])), candidate = await load(root);
-const reuse = process.argv[3] === '--reuse';
+const reuse = process.argv.includes('--reuse');
+const colorStress = process.argv.includes('--color-stress');
 const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]!;
 
 async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
@@ -30,6 +31,8 @@ async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
     for (let i = 0; i < 512; i++) body([0.8, 0.8, 0.8], 1, [(i % 32) - 16, Math.floor(i / 32) - 8, 1.3]);
   } else if (scene === 'pile') {
     for (let i = 0; i < 125; i++) body([0.95, 0.95, 0.95], 1, [(i % 5) - 2, Math.floor(i / 5) % 5 - 2, Math.floor(i / 25) + 0.5]);
+  } else if (scene === 'dense-tail') {
+    for (let i = 0; i < 1000; i++) body([0.1, 0.1, 0.1], 1, [(i % 40) - 20, Math.floor(i / 40) - 12, 3]);
   } else {
     body([1, 1, 1], 1, [0, 0, 8]);
     for (let i = 0; i < 32; i++) {
@@ -38,16 +41,27 @@ async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
     }
   }
   const gpu = new api.GpuSolver3D(device, ref, { spatialSort: false });
-  if (scene === 'hub') gpu.appendJoints(Array.from({ length: 32 }, (_, i) => {
+  if (scene === 'hub' || scene === 'sparse-hub') gpu.appendJoints(Array.from({ length: 32 }, (_, i) => {
     const a = 2 * Math.PI * i / 32;
     return { a: 1, b: i + 2, rA: [2 * Math.cos(a), 2 * Math.sin(a), 0], rB: [0, 0, 0] };
   }));
+  if (scene === 'sparse-hub') gpu.fixedColors = Uint32Array.from({ length: 34 }, (_, i) => i === 0 ? 255 : i + 30);
+  if (scene === 'dense-tail') gpu.fixedColors = Uint32Array.from({ length: 1001 }, (_, i) => i === 0 ? 255 : 63);
   gpu.params.dt = 1 / 120;
   const step = (i: number) => gpu.step({ reuseManifolds: reuse && api === candidate && i % 2 === 1 });
   try {
-    for (let i = 0; i < 60; i++) step(i);
+    for (let i = 0; i < 60; i++) {
+      if (colorStress) {
+        gpu.params.iterations = [0, 4, 14][Math.floor(i / 10) % 3]!;
+        gpu.params.alpha = i < 30 ? 0.95 : 0.8;
+        gpu.colorCap = i < 20 ? 12 : i < 40 ? 64 : 16;
+      }
+      step(i);
+    }
+    if (colorStress) { gpu.params.iterations = 14; gpu.params.alpha = 0.95; gpu.colorCap = 64; }
     await device!.queue.onSubmittedWorkDone();
     const states = new Float32Array(await gpu.readBodies());
+    gpu.adapt(await gpu.readCounters());
     const started = performance.now();
     for (let i = 0; i < 120; i++) step(i);
     await device!.queue.onSubmittedWorkDone();
@@ -69,7 +83,7 @@ async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
   } finally { gpu.destroy(); }
 }
 
-for (const scene of ['fixed-heavy', 'pile', 'hub', 'mixed-sizes']) {
+for (const scene of ['fixed-heavy', 'pile', 'hub', 'mixed-sizes', 'sparse-hub', 'dense-tail']) {
   const a = await measure(baseline, scene), b = await measure(candidate, scene);
   const compare = (left: Float32Array, right: Float32Array) => {
     let differing = 0, maxDifference = 0, maxPositionDifference = 0;
@@ -84,6 +98,6 @@ for (const scene of ['fixed-heavy', 'pile', 'hub', 'mixed-sizes']) {
     return { differing, maxDifference, maxPositionDifference };
   };
   const early = compare(a.states, b.states), late = compare(a.lateStates, b.lateStates);
-  console.log(JSON.stringify({ scene, reuse, early: { steps: 60, ...early }, late: { steps: 180, ...late }, baseline: { wallMs: a.wallMs, gpu: a.gpu, counters: a.counters }, candidate: { wallMs: b.wallMs, gpu: b.gpu, counters: b.counters } }));
+  console.log(JSON.stringify({ scene, reuse, colorStress, early: { steps: 60, ...early }, late: { steps: 180, ...late }, baseline: { wallMs: a.wallMs, gpu: a.gpu, counters: a.counters }, candidate: { wallMs: b.wallMs, gpu: b.gpu, counters: b.counters } }));
   if ((early.differing || late.differing) && !reuse) process.exitCode = 1;
 }

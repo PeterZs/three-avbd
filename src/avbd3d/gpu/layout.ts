@@ -92,6 +92,7 @@ export const STICK_BIT = 0x80000000;
 // Counter words beyond the shared ones (../../avbd2d/gpu/layout.ts uses 0-5)
 export const C_MANIFOLDS = 6;
 export const C_PREV_MANIFOLDS = 7;
+export const C_TAIL_BODIES = 8;
 
 /**
  * Shape codes in angVel.w (spheres: see ../shapes.ts; radius = size.x / 2). A sail collides
@@ -116,6 +117,8 @@ export const FLAG_START_AT_REST = 8;
 /** A contact's normal penalty starts at the lighter body's m/dt² (wgsl-collision.ts contactPenaltyMin). */
 export const FLAG_MASS_PENALTY = 16;
 export const FLAG_REUSE_MANIFOLDS = 64;
+export const FLAG_SPARSE_COLORS = 32;
+export const SPARSE_COLOR_START = 16;
 /** Speed (m/s) of a body's fastest point, |v| + |ω|·radius, below which FLAG_START_AT_REST applies. */
 export const REST_SPEED = 0.1;
 /**
@@ -128,7 +131,7 @@ export const REUSE_ANG_TOL = 0.002;
 export const NEAREST_FRACTION = 0.05;
 
 /** Words in the Params uniform (see the struct in PRELUDE_3D). */
-export const PARAM_WORDS = 44;
+export const PARAM_WORDS = 48;
 
 export const PRELUDE_3D = /* wgsl */ `
 // Shared by every 3D module (avbd3d/gpu/layout.ts)
@@ -158,6 +161,8 @@ const FLAG_REUSE_CONTACTS = ${FLAG_REUSE_CONTACTS}u;
 const FLAG_START_AT_REST = ${FLAG_START_AT_REST}u;
 const FLAG_MASS_PENALTY = ${FLAG_MASS_PENALTY}u;
 const FLAG_REUSE_MANIFOLDS = ${FLAG_REUSE_MANIFOLDS}u;
+const FLAG_SPARSE_COLORS = ${FLAG_SPARSE_COLORS}u;
+const SPARSE_COLOR_START = ${SPARSE_COLOR_START}u;
 const REST_SPEED = ${REST_SPEED};
 const NEAREST_FRACTION = ${NEAREST_FRACTION};
 
@@ -243,6 +248,7 @@ struct Params {
   wind: vec4f,         // xyz: wind velocity (m/s), w: air pressure coefficient ½ρC_d
   gust: vec4f,         // x: gust strength (fraction of the wind)
   up: vec4f,           // xyz: which way is up (unit)
+  fineGrid: vec4f,     // x: fine cell size, y: fine radius threshold, z: coarse movers present
 }
 
 fn qmul(a: vec4f, b: vec4f) -> vec4f {

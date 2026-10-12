@@ -83,28 +83,33 @@ fn isLarge(i: u32) -> bool {
   return radius(i) > params.maxSmallRadius;
 }
 
-fn cellOf(i: u32) -> vec3i {
-  return vec3i(floor(bodies[i].pos.xyz / params.cellSize));
+fn levelOf(i: u32) -> u32 {
+  return select(0u, 1u, radius(i) > params.fineGrid.y);
 }
 
-fn cellHash(c: vec3i) -> u32 {
-  return ((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u)) & params.tableMask;
+fn cellAt(i: u32, level: u32) -> vec3i {
+  let size = select(params.fineGrid.x, params.cellSize, level == 1u);
+  return vec3i(floor(bodies[i].pos.xyz / size));
+}
+
+fn cellHash(c: vec3i, level: u32) -> u32 {
+  return ((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u) ^ (level * 2654435769u)) & params.tableMask;
 }
 
 @compute @workgroup_size(64)
 fn gridCount(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= params.bodyCount || isLarge(i)) { return; }
-  let c = cellOf(i);
+  let c = cellAt(i, levelOf(i));
   for (var k = 0u; k < 3u; k++) { atomicStore(&grid[params.gridCellOffset + 3u * i + k], bitcast<u32>(c[k])); }
-  atomicAdd(&grid[cellHash(c)], 1u);
+  atomicAdd(&grid[cellHash(c, levelOf(i))], 1u);
 }
 
 @compute @workgroup_size(64)
 fn gridScatter(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= params.bodyCount || isLarge(i)) { return; }
-  let h = cellHash(cellOf(i));
+  let h = cellHash(cellAt(i, levelOf(i)), levelOf(i));
   let slot = atomicLoad(&grid[h]) + atomicAdd(&grid[params.gridCursorOffset + h], 1u);
   atomicStore(&grid[params.gridSortedOffset + slot], i);
 }
@@ -220,38 +225,91 @@ fn testPair(P: Probe, j: u32) {
   pairs[slot] = vec2u(a, b);
 }
 
+/**
+ * Only dynamic bodies probe: a pair with a fixed body (or one sleeping as fixed) is emitted
+ * from its dynamic body. Fixed invocations return before loading shapes or scanning the grid,
+ * without a probe-list allocation, atomic append or indirect-argument dispatch. Their pairs with
+ * the large dynamic bodies, which scan no grid, are findFixedLarge's.
+ */
 @compute @workgroup_size(64)
 fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
-  if (i >= params.bodyCount) { return; }
+  if (i >= params.bodyCount || bodies[i].size.w <= 0.0) { return; }
   let small = !isLarge(i);
   let P = probeOf(i);
   if (small) {
-    // Every overlapping small pair is in the same or an adjacent cell; emit from the higher index
-    let c = cellOf(i);
-    for (var oz = -1; oz <= 1; oz++) {
-      for (var oy = -1; oy <= 1; oy++) {
-        for (var ox = -1; ox <= 1; ox++) {
-          let cell = c + vec3i(ox, oy, oz);
-          let h = cellHash(cell);
-          let end = atomicLoad(&grid[h + 1u]);
-          for (var k = atomicLoad(&grid[h]); k < end; k++) {
-            let j = atomicLoad(&grid[params.gridSortedOffset + k]);
-            if (j >= i) { continue; }
-            // Different cells can share a bucket; only accept bodies really in this cell
-            let o = params.gridCellOffset + 3u * j;
-            let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
-            if (any(cj != cell)) { continue; }
-            testPair(P, j);
+    let ownLevel = levelOf(i);
+    let lastLevel = select(0u, 1u, params.fineGrid.x < params.cellSize);
+    // Same-level dynamic pairs belong to the higher index, fixed pairs to the mover;
+    // cross-level pairs belong to the finer body (fixed ones use findFixedLarge). Each queried cell is at least twice the
+    // largest radius in that level, so 27 cells conservatively cover every overlap.
+    for (var level = ownLevel; level <= lastLevel; level++) {
+      let c = cellAt(i, level);
+      for (var oz = -1; oz <= 1; oz++) {
+        for (var oy = -1; oy <= 1; oy++) {
+          for (var ox = -1; ox <= 1; ox++) {
+            let cell = c + vec3i(ox, oy, oz);
+            let h = cellHash(cell, level);
+            let end = atomicLoad(&grid[h + 1u]);
+            for (var k = atomicLoad(&grid[h]); k < end; k++) {
+              let j = atomicLoad(&grid[params.gridSortedOffset + k]);
+              if (levelOf(j) != level || (j == i || (ownLevel == level && j > i && bodies[j].size.w > 0.0))) { continue; }
+              let o = params.gridCellOffset + 3u * j;
+              let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
+              if (any(cj != cell)) { continue; }
+              testPair(P, j);
+            }
           }
         }
       }
     }
   }
-  // Large bodies against everything (large-large pairs once, from the larger index)
+  // Large bodies against everything: a dynamic large-large pair once (from the smaller index),
+  // a fixed large body from this dynamic one
   for (var k = 0u; k < params.largeCount; k++) {
     let l = statics[k];
-    if (l == i || (!small && l < i)) { continue; }
+    if (l == i || (!small && l < i && bodies[l].size.w > 0.0)) { continue; }
+    testPair(P, l);
+  }
+}
+
+/** Small fixed bodies against the large dynamic ones; dispatched only while there are any. */
+@compute @workgroup_size(64)
+fn findFixedLarge(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= params.bodyCount || bodies[i].size.w > 0.0 || isLarge(i)) { return; }
+  // Fine fixed bodies own their pairs with coarse movers, since fixed bodies do not
+  // run findPairs and a coarse body cannot cover fine cells with just 27 probes.
+  if (params.fineGrid.z > 0.0 && levelOf(i) == 0u) {
+    let c = cellAt(i, 1u);
+    let F = probeOf(i);
+    for (var oz = -1; oz <= 1; oz++) {
+      for (var oy = -1; oy <= 1; oy++) {
+        for (var ox = -1; ox <= 1; ox++) {
+          let cell = c + vec3i(ox, oy, oz);
+          let h = cellHash(cell, 1u);
+          let end = atomicLoad(&grid[h + 1u]);
+          for (var k = atomicLoad(&grid[h]); k < end; k++) {
+            let j = atomicLoad(&grid[params.gridSortedOffset + k]);
+            if (levelOf(j) != 1u || bodies[j].size.w <= 0.0) { continue; }
+            let o = params.gridCellOffset + 3u * j;
+            let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
+            if (any(cj != cell)) { continue; }
+            testPair(F, j);
+          }
+        }
+      }
+    }
+  }
+  var P: Probe;
+  var loaded = false;
+  for (var k = 0u; k < params.largeCount; k++) {
+    let l = statics[k];
+    if (bodies[l].size.w <= 0.0) { continue; }
+    if (!loaded) {
+      P = probeOf(i);
+      loaded = true;
+    }
     testPair(P, l);
   }
 }
