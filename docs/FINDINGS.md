@@ -1488,3 +1488,13 @@ not universal cross-device bitwise determinism. No version bump or publication w
 Combined #14/#16/#17 integration: all gate components passed (81 CPU, 81 GPU, zero skips),
 with an explicit fine/coarse fixed/dynamic ownership regression. Six cap-stress comparison
 scenes against pre-optimization main retain bit-identical complete body states at 60 steps.
+
+### STE-2538 combined replay follow-up
+
+Sparse color fusion is now opt-in (`fuseSparseColors = true`). The destruction
+play-session matched the baseline through 815 frames but diverged at frame 816
+with fusion enabled, with zero reported coloring clashes; disabling fusion
+restored the first 900 frames. The focused synthetic tests did not expose this
+real contact/joint transition. Earlier fusion timings describe the experimental
+path, not a replay-safe default. The exact fused-entry-point difference remains
+unresolved; keep the original per-color dispatch path for deterministic replay.
