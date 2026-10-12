@@ -3,7 +3,7 @@
 // 2D pipeline's (../../avbd2d/gpu/layout.ts). As there, Infinity is never stored on the GPU:
 // unbounded stiffness is BIG and a row is hard when its stiffness is >= HARD.
 
-import { CORE_WGSL } from '../../avbd2d/gpu/layout.ts';
+import { ARGS_WORDS, CORE_WGSL } from '../../avbd2d/gpu/layout.ts';
 
 /**
  * Floats per body, 10 vec4. Everything a contact reads comes first (one 64-byte span):
@@ -92,6 +92,11 @@ export const STICK_BIT = 0x80000000;
 // Counter words beyond the shared ones (../../avbd2d/gpu/layout.ts uses 0-5)
 export const C_MANIFOLDS = 6;
 export const C_PREV_MANIFOLDS = 7;
+/** Dynamic bodies listed by gridCount, each a findPairs thread (the broadphase probes). */
+export const C_PROBES = 8;
+/** The findPairs dispatch's indirect arguments, after the shared ones (ARGS_WORDS). */
+export const IA_PROBES = ARGS_WORDS;
+export const ARGS_WORDS_3D = ARGS_WORDS + 3;
 
 /**
  * Shape codes in angVel.w (spheres: see ../shapes.ts; radius = size.x / 2). A sail collides
@@ -127,7 +132,7 @@ export const REUSE_ANG_TOL = 0.002;
 export const NEAREST_FRACTION = 0.05;
 
 /** Words in the Params uniform (see the struct in PRELUDE_3D). */
-export const PARAM_WORDS = 44;
+export const PARAM_WORDS = 48;
 
 export const PRELUDE_3D = /* wgsl */ `
 // Shared by every 3D module (avbd3d/gpu/layout.ts)
@@ -148,6 +153,8 @@ const SHAPE_HULL = ${SHAPE_HULL}.0;
 const STICK_BIT = ${STICK_BIT}u;
 const C_MANIFOLDS = ${C_MANIFOLDS}u;
 const C_PREV_MANIFOLDS = ${C_PREV_MANIFOLDS}u;
+const C_PROBES = ${C_PROBES}u;
+const IA_PROBES = ${IA_PROBES}u;
 /** Feature key of every contact involving a sphere (one contact per pair). */
 const SPHERE_FEATURE = 3u << 24u;
 
@@ -241,6 +248,10 @@ struct Params {
   wind: vec4f,         // xyz: wind velocity (m/s), w: air pressure coefficient ½ρC_d
   gust: vec4f,         // x: gust strength (fraction of the wind)
   up: vec4f,           // xyz: which way is up (unit)
+  gridProbesOffset: u32, // the grid's list of dynamic bodies (findPairs threads)
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 }
 
 fn qmul(a: vec4f, b: vec4f) -> vec4f {
@@ -328,4 +339,9 @@ export const ARGS_ITEMS_3D = {
   prevCounter: 'C_PREV_MANIFOLDS',
   capacity: 'params.manifoldCapacity',
   colorThreads: PRIMAL_LANES_WGSL,
+  extra: /* wgsl */ `
+@compute @workgroup_size(1)
+fn argsProbes() {
+  setArgs(IA_PROBES, min(counters[C_PROBES], params.bodyCount));
+}`,
 };
