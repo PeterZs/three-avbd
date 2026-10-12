@@ -220,14 +220,21 @@ fn testPair(P: Probe, j: u32) {
   pairs[slot] = vec2u(a, b);
 }
 
+/**
+ * Only dynamic bodies probe: a pair with a fixed body (or one sleeping as fixed) is emitted
+ * from its dynamic body. Fixed invocations return before loading shapes or scanning the grid,
+ * without a probe-list allocation, atomic append or indirect-argument dispatch. Their pairs with
+ * the large dynamic bodies, which scan no grid, are findFixedLarge's.
+ */
 @compute @workgroup_size(64)
 fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
-  if (i >= params.bodyCount) { return; }
+  if (i >= params.bodyCount || bodies[i].size.w <= 0.0) { return; }
   let small = !isLarge(i);
   let P = probeOf(i);
   if (small) {
-    // Every overlapping small pair is in the same or an adjacent cell; emit from the higher index
+    // Every overlapping small pair is in the same or an adjacent cell; a dynamic pair is emitted
+    // from its higher index, a pair with a fixed body from the dynamic one
     let c = cellOf(i);
     for (var oz = -1; oz <= 1; oz++) {
       for (var oy = -1; oy <= 1; oy++) {
@@ -237,7 +244,7 @@ fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
           let end = atomicLoad(&grid[h + 1u]);
           for (var k = atomicLoad(&grid[h]); k < end; k++) {
             let j = atomicLoad(&grid[params.gridSortedOffset + k]);
-            if (j >= i) { continue; }
+            if (j == i || (j > i && bodies[j].size.w > 0.0)) { continue; }
             // Different cells can share a bucket; only accept bodies really in this cell
             let o = params.gridCellOffset + 3u * j;
             let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
@@ -248,10 +255,29 @@ fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
       }
     }
   }
-  // Large bodies against everything (large-large pairs once, from the larger index)
+  // Large bodies against everything: a dynamic large-large pair once (from the smaller index),
+  // a fixed large body from this dynamic one
   for (var k = 0u; k < params.largeCount; k++) {
     let l = statics[k];
-    if (l == i || (!small && l < i)) { continue; }
+    if (l == i || (!small && l < i && bodies[l].size.w > 0.0)) { continue; }
+    testPair(P, l);
+  }
+}
+
+/** Small fixed bodies against the large dynamic ones; dispatched only while there are any. */
+@compute @workgroup_size(64)
+fn findFixedLarge(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= params.bodyCount || bodies[i].size.w > 0.0 || isLarge(i)) { return; }
+  var P: Probe;
+  var loaded = false;
+  for (var k = 0u; k < params.largeCount; k++) {
+    let l = statics[k];
+    if (bodies[l].size.w <= 0.0) { continue; }
+    if (!loaded) {
+      P = probeOf(i);
+      loaded = true;
+    }
     testPair(P, l);
   }
 }
