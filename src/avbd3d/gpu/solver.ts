@@ -28,7 +28,7 @@ import { hullOf, isSail, isSphere, type HullShape } from '../shapes.ts';
 import { rotate, vec3 } from '../ref/math.ts';
 import { broadphaseWGSL, contactsHullWGSL, contactsWGSL, refsWGSL } from './wgsl-collision.ts';
 import { solveWGSL } from './wgsl-solve.ts';
-import { largestSmall } from './radii.ts';
+import { LARGE_FACTOR, largestSmall } from './radii.ts';
 
 export { PHASES, type StepProfile };
 
@@ -529,6 +529,9 @@ export class GpuSolver3D {
   private readonly tableSize: number;
   private hashSize = 0;
   private cellSize = 1;
+  private coarseDynamic = false;
+  private fineCellSize = 1;
+  private fineRadius = 0;
   private maxSmallRadius = 0;
   private largeCount = 0;
   private noCollideCount = 0;
@@ -823,7 +826,7 @@ export class GpuSolver3D {
     const f = new Float32Array(Math.max(bodies.length, 1) * BODY_FLOATS);
     bodies.forEach((b, k) => {
       const info = this.pack(b, f, k * BODY_FLOATS, this.bodies[first + k]?.hull);
-      if (this.bodies[first + k]?.radius !== info.radius) this.radiiDirty = true;
+      if (this.bodies[first + k]?.radius !== info.radius || this.bodies[first + k]?.dynamic !== info.dynamic) this.radiiDirty = true;
       this.bodies[first + k] = info;
     });
     this.device.queue.writeBuffer(this.bodyBuffer, first * BODY_FLOATS * 4, f, 0, bodies.length * BODY_FLOATS);
@@ -866,7 +869,7 @@ export class GpuSolver3D {
         for (let a = 0; a < 3; a++) f[o + B_POS + a] = positions[3 * i + a];
         if (rotations) for (let a = 0; a < 4; a++) f[o + B_ROT + a] = rotations[4 * i + a];
         const was = this.bodies[indices[i]];
-        if (was?.radius !== info.radius) this.radiiDirty = true;
+        if (was?.radius !== info.radius || was?.dynamic !== info.dynamic) this.radiiDirty = true;
         // Boxes now: a hull the slot collided as goes when nothing else uses it
         if (was?.hull) this.releaseHull(was.hull);
         this.bodies[indices[i]] = { ...info, size: [...info.size] as [number, number, number] };
@@ -963,6 +966,22 @@ export class GpuSolver3D {
       const threshold = minLarge === Infinity ? maxSmall * 1.5 : (maxSmall + minLarge) / 2;
       this.maxSmallRadius = threshold;
       this.cellSize = Math.max(2 * maxSmall * (1 + 1e-4), 1e-3);
+      // Held slabs must not force small moving pieces into slab-sized cells. Keep the
+      // existing coarse level and large-body list, adding a fine level only for a useful
+      // size separation. Cross-level pairs are always probed by the finer body.
+      const moving = Float64Array.from(this.bodies.slice(0, n).filter(b => b.dynamic), b => b.radius);
+      const target = moving.length ? Math.min(maxSmall, LARGE_FACTOR * largestSmall(moving)) : maxSmall;
+      let fine = 0;
+      for (let i = 0; i < n; i++) if (radii[i] <= target) fine = Math.max(fine, radii[i]);
+      this.fineCellSize = this.cellSize;
+      this.fineRadius = threshold;
+      if (fine > 0 && fine * 2 < maxSmall) {
+        let next = Infinity;
+        for (let i = 0; i < n; i++) if (radii[i] > fine) next = Math.min(next, radii[i]);
+        this.fineCellSize = Math.max(2 * fine * (1 + 1e-4), 1e-3);
+        this.fineRadius = (fine + next) / 2;
+      }
+      this.coarseDynamic = this.fineCellSize < this.cellSize && this.bodies.slice(0, n).some(b => b.dynamic && b.radius > this.fineRadius && b.radius <= threshold);
       this.large = [];
       for (let i = 0; i < n; i++) if (this.bodies[i].radius > threshold) this.large.push(i);
       this.radiiDirty = false;
@@ -1380,6 +1399,7 @@ export class GpuSolver3D {
     u[31] = log2(this.primalLanes[0]) | (log2(this.primalLanes[1]) << 8) | (log2(this.primalLanes[2]) << 16);
     f.set([p.windSpeed * Math.cos(p.windAngle), p.windSpeed * Math.sin(p.windAngle), 0, p.windPressure, p.windGust], 32);
     f.set([p.up[0], p.up[1], p.up[2], 0], 40);
+    f.set([this.fineCellSize, this.fineRadius, Number(this.coarseDynamic), 0], 44);
     this.device.queue.writeBuffer(this.paramsBuffer, 0, buf);
   }
 
@@ -1477,7 +1497,7 @@ export class GpuSolver3D {
     this.gridScan.encode(pass);
     run('gridScatter', G.broad, groups(N));
     run('findPairs', G.broad, groups(N));
-    if (this.large.some(i => this.bodies[i]?.dynamic)) run('findFixedLarge', G.broad, groups(N));
+    if (this.coarseDynamic || this.large.some(i => this.bodies[i]?.dynamic)) run('findFixedLarge', G.broad, groups(N));
     run('argsPairs', G.args, 1);
     runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
     run('argsContacts', G.args, 1);

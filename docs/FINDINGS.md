@@ -1306,6 +1306,41 @@ Revisit the GPU default (post-stab vs α) with these metrics in Stage 2.
 - CPU cost (M-series, Node): Pyramid (211 bodies) 2.7 ms/step, Joint Grid (625) 7.3 ms/step;
   the O(n²) broadphase dominates the grid scene.
 
+## Two-level broadphase grid (#17, 2026-10-12)
+
+When held slabs enlarge the existing grid, moving-body radii now select an additional fine
+level. Similarly sized fixed pieces share that level; coarse pieces retain the existing
+cell size. Both levels share the hash table and scan buffers, with level-salted hashes and
+explicit level/cell checks. Within a level, dynamic/dynamic pairs belong to the higher index
+and dynamic/fixed pairs to the dynamic body. Cross-level pairs belong to the finer body;
+fine fixed bodies use the auxiliary pass when coarse movers exist. Each scan needs only 27 cells.
+The original large-body list remains for extreme sizes. With no useful size separation,
+the grid stays at one level. Radius or dynamic/fixed changes refresh the classification.
+
+Validation: all gate components passed: 81 CPU tests, 76 Dawn GPU tests, no skips,
+typecheck and Vite/library builds. GPU files ran sequentially. The new brute-force pair test
+covers fine/coarse/large bodies, both index orders, duplicate exclusion, sleeping, waking
+and resizing. Independent review caught an initial fixture that never activated the fine
+level; the corrected fixture explicitly asserts each stage's grid configuration.
+Three comparison runs against main 9b9c27b produced identical complete body-state buffers
+after 60 steps in all four scenes, with no overflow.
+
+M4 Max, shared load (6.94, GPU utilization 49% at the start of the final comparison batch).
+Medians of three runs, each with 120 steps and nine timestamp samples:
+
+| Scene | Wall ms/step old -> new | GPU collision ms old -> new | GPU total ms old -> new |
+| --- | ---: | ---: | ---: |
+| 10k fixed + 512 moving, similar sizes | 1.142 -> 1.453 | 0.131 -> 0.197 | 0.590 -> 0.590 |
+| 125-body pile | 1.442 -> 1.356 | 0.131 -> 0.131 | 0.786 -> 0.786 |
+| 32-joint hub | 1.404 -> 1.239 | 0.066 -> 0.066 | 0.655 -> 0.655 |
+| 160 held slabs + 4k small fixed pieces + 512 moving pieces | 2.865 -> 1.144 | 2.163 -> 0.197 | 2.687 -> 0.721 |
+
+The targeted mixed-size case improves substantially. Other wall-time results are mixed
+under load; the similar-size case is slower in wall time and differs by one timestamp tick
+in collision, with unchanged GPU total. No universal speedup or older-hardware claim.
+The comparison script is reproducible with a baseline checkout path; the original CPU
+capacity estimate stays conservative and unchanged. No npm version/publication change.
+
 ## Bounded color-tail dispatches (#16, 2026-10-12)
 
 For small active sets, colors 16 and above now run in one workgroup, sequentially by color
@@ -1355,7 +1390,9 @@ hardware still need measurements before extrapolating these targeted gains.
 
 ## Fixed-body broadphase probes (#14, 2026-10-12)
 
-Fixed invocations now return before loading their shape or scanning grid neighbors. A dynamic
+Fixed invocations in the primary probe pass return before loading their shape or scanning
+grid neighbors. Combined with #17, the auxiliary pass scans coarse neighbors for fine fixed
+bodies only when coarse movers exist. A dynamic
 small body owns its pairs with fixed small bodies regardless of index; the large-body path owns
 fixed-large pairs, and a separate pass handles small fixed versus large dynamic bodies when needed.
 The saved WIP's compacted probe list was removed: it added atomics, a buffer region and an argument
@@ -1384,3 +1421,7 @@ GPU timestamps are quantized at about 0.0655 ms here. The small wall-time change
 load are not evidence of a robust FPS gain; representative hull-heavy and target-device measurements
 remain necessary. This establishes pair coverage and state equivalence for the measured scenes,
 not universal cross-device bitwise determinism. No version bump or publication was performed.
+
+Combined #14/#16/#17 integration: all gate components passed (81 CPU, 81 GPU, zero skips),
+with an explicit fine/coarse fixed/dynamic ownership regression. Six cap-stress comparison
+scenes against pre-optimization main retain bit-identical complete body states at 60 steps.

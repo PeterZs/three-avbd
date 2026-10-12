@@ -20,7 +20,11 @@ async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
   const ref = new api.Solver();
   const body = (size: number[], density: number, position: number[]) => new api.Rigid(ref, size, density, 0.5, position);
   body([60, 60, 1], 0, [0, 0, -0.5]);
-  if (scene === 'fixed-heavy') {
+  if (scene === 'mixed-sizes') {
+    for (let i = 0; i < 160; i++) body([4, 4, 0.5], 0, [200 + (i % 16) * 5, Math.floor(i / 16) * 5, 0]);
+    for (let i = 0; i < 4000; i++) body([0.45, 0.45, 0.45], 0, [(i % 80) * 0.5 - 20, Math.floor(i / 80) * 0.5 - 12.5, 0.225]);
+    for (let i = 0; i < 512; i++) body([0.4, 0.4, 0.4], 1, [(i % 32) * 0.5 - 8, Math.floor(i / 32) * 0.5 - 4, 0.65]);
+  } else if (scene === 'fixed-heavy') {
     for (let i = 0; i < 10000; i++) body([0.9, 0.9, 0.9], 0, [(i % 100) - 50, Math.floor(i / 100) - 50, 0.45]);
     for (let i = 0; i < 512; i++) body([0.8, 0.8, 0.8], 1, [(i % 32) - 16, Math.floor(i / 32) - 8, 1.3]);
   } else if (scene === 'pile') {
@@ -71,7 +75,7 @@ async function measure(api: Awaited<ReturnType<typeof load>>, scene: string) {
   } finally { gpu.destroy(); }
 }
 
-for (const scene of (process.argv[3] ? [process.argv[3]] : ['fixed-heavy', 'pile', 'hub', 'sparse-hub', 'dense-tail'])) {
+for (const scene of (process.argv[3] ? [process.argv[3]] : ['fixed-heavy', 'pile', 'hub', 'sparse-hub', 'dense-tail', 'mixed-sizes'])) {
   const a = await measure(baseline, scene), b = await measure(candidate, scene);
   let differing = 0, maxDifference = 0;
   assert.equal(a.states.length, b.states.length);
