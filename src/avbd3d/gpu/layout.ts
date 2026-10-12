@@ -116,6 +116,7 @@ export const FLAG_REUSE_CONTACTS = 4;
 export const FLAG_START_AT_REST = 8;
 /** A contact's normal penalty starts at the lighter body's m/dt² (wgsl-collision.ts contactPenaltyMin). */
 export const FLAG_MASS_PENALTY = 16;
+export const FLAG_REUSE_MANIFOLDS = 64;
 export const FLAG_SPARSE_COLORS = 32;
 export const SPARSE_COLOR_START = 16;
 /** Speed (m/s) of a body's fastest point, |v| + |ω|·radius, below which FLAG_START_AT_REST applies. */
@@ -159,6 +160,7 @@ const FLAG_FACE_BIAS = ${FLAG_FACE_BIAS}u;
 const FLAG_REUSE_CONTACTS = ${FLAG_REUSE_CONTACTS}u;
 const FLAG_START_AT_REST = ${FLAG_START_AT_REST}u;
 const FLAG_MASS_PENALTY = ${FLAG_MASS_PENALTY}u;
+const FLAG_REUSE_MANIFOLDS = ${FLAG_REUSE_MANIFOLDS}u;
 const FLAG_SPARSE_COLORS = ${FLAG_SPARSE_COLORS}u;
 const SPARSE_COLOR_START = ${SPARSE_COLOR_START}u;
 const REST_SPEED = ${REST_SPEED};

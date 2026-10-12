@@ -69,7 +69,7 @@ fn beginFrame() {
   atomicStore(&counters[C_PREV_CONTACTS], min(atomicLoad(&counters[C_CONTACTS]), params.contactCapacity));
   atomicStore(&counters[C_MANIFOLDS], 0u);
   atomicStore(&counters[C_CONTACTS], 0u);
-  atomicStore(&counters[C_PAIRS], 0u);
+  if ((params.flags & FLAG_REUSE_MANIFOLDS) == 0u) { atomicStore(&counters[C_PAIRS], 0u); }
   atomicStore(&counters[C_OVERFLOW], 0u);
   atomicStore(&counters[C_CLASHES], 0u);
   atomicStore(&counters[C_NUM_COLORS], 0u);
@@ -702,16 +702,26 @@ fn reuseContacts(a: u32, b: u32) -> bool {
   let moved = max(bitcast<u32>(bodies[a].inertialPos.w), bitcast<u32>(bodies[b].inertialPos.w));
   if (count == 0u || generated < moved) { return false; }
 
+  copyContacts(prev);
+  return true;
+}
+
+// Refresh C(x-) and warm-start values without generating a new contact set. The caller
+// explicitly opts into retaining normals/anchors across the remaining substeps.
+fn copyContacts(prev: Manifold) {
+  let a = prev.ids.x;
+  let b = prev.ids.y;
+  let count = pairCount(prev);
   let m = atomicAdd(&counters[C_MANIFOLDS], 1u);
   if (m >= params.manifoldCapacity) {
     atomicOr(&counters[C_OVERFLOW], 4u);
-    return true;
+    return;
   }
   let base = atomicAdd(&counters[C_CONTACTS], count);
   if (base + count > params.contactCapacity) {
     atomicOr(&counters[C_OVERFLOW], 2u);
     manifolds[m] = Manifold(vec4u(a, b, base, prev.ids.w & ~15u), prev.geo);
-    return true;
+    return;
   }
   manifolds[m] = Manifold(vec4u(a, b, base, prev.ids.w), prev.geo);
 
@@ -732,7 +742,13 @@ fn reuseContacts(a: u32, b: u32) -> bool {
     k.pen.x = max(k.pen.x, contactPenaltyMin(a, b));
     contacts[base + i] = k;
   }
-  return true;
+}
+
+@compute @workgroup_size(64)
+fn reuseManifolds(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= min(atomicLoad(&counters[C_PREV_MANIFOLDS]), params.manifoldCapacity)) { return; }
+  let prev = prevManifolds[gid.x];
+  if (pairCount(prev) > 0u) { copyContacts(prev); }
 }
 
 ${hulls ? HULL_WGSL : 'fn isHull(i: u32) -> bool { return false; }'}
