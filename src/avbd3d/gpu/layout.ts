@@ -127,7 +127,7 @@ export const REUSE_ANG_TOL = 0.002;
 export const NEAREST_FRACTION = 0.05;
 
 /** Words in the Params uniform (see the struct in PRELUDE_3D). */
-export const PARAM_WORDS = 44;
+export const PARAM_WORDS = 48;
 
 export const PRELUDE_3D = /* wgsl */ `
 // Shared by every 3D module (avbd3d/gpu/layout.ts)
@@ -241,6 +241,7 @@ struct Params {
   wind: vec4f,         // xyz: wind velocity (m/s), w: air pressure coefficient ½ρC_d
   gust: vec4f,         // x: gust strength (fraction of the wind)
   up: vec4f,           // xyz: which way is up (unit)
+  fineGrid: vec4f,     // x: fine cell size, y: fine radius threshold (coarse uses cellSize)
 }
 
 fn qmul(a: vec4f, b: vec4f) -> vec4f {

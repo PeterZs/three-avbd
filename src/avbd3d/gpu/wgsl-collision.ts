@@ -83,28 +83,33 @@ fn isLarge(i: u32) -> bool {
   return radius(i) > params.maxSmallRadius;
 }
 
-fn cellOf(i: u32) -> vec3i {
-  return vec3i(floor(bodies[i].pos.xyz / params.cellSize));
+fn levelOf(i: u32) -> u32 {
+  return select(0u, 1u, radius(i) > params.fineGrid.y);
 }
 
-fn cellHash(c: vec3i) -> u32 {
-  return ((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u)) & params.tableMask;
+fn cellAt(i: u32, level: u32) -> vec3i {
+  let size = select(params.fineGrid.x, params.cellSize, level == 1u);
+  return vec3i(floor(bodies[i].pos.xyz / size));
+}
+
+fn cellHash(c: vec3i, level: u32) -> u32 {
+  return ((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u) ^ (level * 2654435769u)) & params.tableMask;
 }
 
 @compute @workgroup_size(64)
 fn gridCount(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= params.bodyCount || isLarge(i)) { return; }
-  let c = cellOf(i);
+  let c = cellAt(i, levelOf(i));
   for (var k = 0u; k < 3u; k++) { atomicStore(&grid[params.gridCellOffset + 3u * i + k], bitcast<u32>(c[k])); }
-  atomicAdd(&grid[cellHash(c)], 1u);
+  atomicAdd(&grid[cellHash(c, levelOf(i))], 1u);
 }
 
 @compute @workgroup_size(64)
 fn gridScatter(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= params.bodyCount || isLarge(i)) { return; }
-  let h = cellHash(cellOf(i));
+  let h = cellHash(cellAt(i, levelOf(i)), levelOf(i));
   let slot = atomicLoad(&grid[h]) + atomicAdd(&grid[params.gridCursorOffset + h], 1u);
   atomicStore(&grid[params.gridSortedOffset + slot], i);
 }
@@ -227,22 +232,27 @@ fn findPairs(@builtin(global_invocation_id) gid: vec3u) {
   let small = !isLarge(i);
   let P = probeOf(i);
   if (small) {
-    // Every overlapping small pair is in the same or an adjacent cell; emit from the higher index
-    let c = cellOf(i);
-    for (var oz = -1; oz <= 1; oz++) {
-      for (var oy = -1; oy <= 1; oy++) {
-        for (var ox = -1; ox <= 1; ox++) {
-          let cell = c + vec3i(ox, oy, oz);
-          let h = cellHash(cell);
-          let end = atomicLoad(&grid[h + 1u]);
-          for (var k = atomicLoad(&grid[h]); k < end; k++) {
-            let j = atomicLoad(&grid[params.gridSortedOffset + k]);
-            if (j >= i) { continue; }
-            // Different cells can share a bucket; only accept bodies really in this cell
-            let o = params.gridCellOffset + 3u * j;
-            let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
-            if (any(cj != cell)) { continue; }
-            testPair(P, j);
+    let ownLevel = levelOf(i);
+    let lastLevel = select(0u, 1u, params.fineGrid.x < params.cellSize);
+    // Same-level pairs belong to the higher index; cross-level pairs to the finer
+    // body, regardless of index or mass. Each queried cell is at least twice the
+    // largest radius in that level, so 27 cells conservatively cover every overlap.
+    for (var level = ownLevel; level <= lastLevel; level++) {
+      let c = cellAt(i, level);
+      for (var oz = -1; oz <= 1; oz++) {
+        for (var oy = -1; oy <= 1; oy++) {
+          for (var ox = -1; ox <= 1; ox++) {
+            let cell = c + vec3i(ox, oy, oz);
+            let h = cellHash(cell, level);
+            let end = atomicLoad(&grid[h + 1u]);
+            for (var k = atomicLoad(&grid[h]); k < end; k++) {
+              let j = atomicLoad(&grid[params.gridSortedOffset + k]);
+              if (levelOf(j) != level || (ownLevel == level && j >= i)) { continue; }
+              let o = params.gridCellOffset + 3u * j;
+              let cj = vec3i(bitcast<i32>(atomicLoad(&grid[o])), bitcast<i32>(atomicLoad(&grid[o + 1u])), bitcast<i32>(atomicLoad(&grid[o + 2u])));
+              if (any(cj != cell)) { continue; }
+              testPair(P, j);
+            }
           }
         }
       }
